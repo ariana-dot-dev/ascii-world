@@ -8,7 +8,7 @@ use std::{
         mpsc as std_mpsc, Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context};
@@ -30,7 +30,7 @@ mod land_mask;
 const ONBOARDING_VERSION: u32 = 3;
 
 #[derive(Parser)]
-#[command(name = "Tokenizers", version, about = "Multiplayer token game")]
+#[command(name = "Ascii World", version, about = "Multiplayer token game")]
 struct Cli {
     #[arg(long, env = "GAME_BACKEND_URL")]
     backend_url: Option<String>,
@@ -179,15 +179,30 @@ async fn run_client(
             .game_api_token
             .as_deref()
             .context("missing game API token")?;
-        let (joined_state, tx) = start_player_connection(&backend_url, token).await?;
-        active_state = joined_state;
-        player_tx = Some(tx);
-        token_worker = Some(TokenScanWorker::start(
-            detected.clone(),
-            state.enabled_ai_tools.clone(),
-            state.ai_usage_baseline.clone(),
-        ));
-        ClientPhase::Playing
+        match start_player_connection(&backend_url, token).await {
+            Ok((joined_state, tx)) => {
+                active_state = joined_state;
+                player_tx = Some(tx);
+                token_worker = Some(TokenScanWorker::start(
+                    detected.clone(),
+                    state.enabled_ai_tools.clone(),
+                    state.ai_usage_baseline.clone(),
+                ));
+                ClientPhase::Playing
+            }
+            Err(error) if is_auth_rejected(&error) => {
+                state.game_api_token = None;
+                state.x_username = None;
+                state.x_name = None;
+                state.onboarding_completed = false;
+                save_state(&state_path, &state)?;
+                if let Some(spectator_state) = start_spectator(&backend_url).await {
+                    active_state = spectator_state;
+                }
+                ClientPhase::Onboarding
+            }
+            Err(error) => return Err(error),
+        }
     };
 
     let _terminal = TerminalGuard::enter()?;
@@ -198,6 +213,11 @@ async fn run_client(
     let mut last_input_send = Instant::now() - Duration::from_millis(50);
     let mut last_frame = Instant::now() - Duration::from_millis(16);
     let mut token_delta = ai_usage::UsageSnapshot::default();
+    let mut last_reported_tokens: Option<u64> = None;
+    let mut last_token_report = Instant::now() - Duration::from_secs(5);
+    let mut reward_dialog_closed = false;
+    let mut market_open = false;
+    let mut market_selected = 0usize;
     let onboarding_panel = UiPanel::onboarding(&detected);
 
     loop {
@@ -206,6 +226,60 @@ async fn run_client(
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
+                    if matches!(phase, ClientPhase::Playing) && market_open {
+                        let live_state = active_state
+                            .lock()
+                            .map(|state| state.clone())
+                            .unwrap_or_default();
+                        let market_len = live_state.market.len().max(1);
+                        match key.code {
+                            KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Esc => {
+                                market_open = false;
+                                renderer.reset();
+                            }
+                            KeyCode::Up => {
+                                market_selected = market_selected.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                market_selected = (market_selected + 1).min(market_len - 1);
+                            }
+                            KeyCode::Enter => {
+                                if let Some(item) = live_state.market.get(market_selected) {
+                                    if let Some(self_player) = live_state.self_player() {
+                                        if let Some(tx) = &player_tx {
+                                            let owned = self_player
+                                                .owned_heads
+                                                .iter()
+                                                .any(|owned| owned == &item.id);
+                                            let equipped = self_player.equipped_head == item.id;
+                                            let _ = if owned && !equipped {
+                                                tx.send(ClientMessage::EquipHead {
+                                                    item_id: item.id.clone(),
+                                                })
+                                            } else {
+                                                tx.send(ClientMessage::BuyHead {
+                                                    item_id: item.id.clone(),
+                                                })
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if matches!(phase, ClientPhase::Playing) && key.code == KeyCode::Enter {
+                        let has_rewards = active_state
+                            .lock()
+                            .map(|state| !state.rewards.is_empty())
+                            .unwrap_or(false);
+                        if has_rewards && !reward_dialog_closed {
+                            reward_dialog_closed = true;
+                            renderer.reset();
+                            continue;
+                        }
+                    }
                     match (&phase, key.code) {
                         (ClientPhase::Onboarding, KeyCode::Enter) if !detected.is_empty() => {
                             state.ai_usage_consent = true;
@@ -239,6 +313,11 @@ async fn run_client(
                             return Ok(());
                         }
                         (_, KeyCode::Esc) => return Ok(()),
+                        (ClientPhase::Playing, KeyCode::Char('m') | KeyCode::Char('M')) => {
+                            market_open = true;
+                            market_selected = 0;
+                            renderer.reset();
+                        }
                         (ClientPhase::Playing, KeyCode::Up) => {
                             input_tracker.up = Some(Instant::now())
                         }
@@ -251,6 +330,11 @@ async fn run_client(
                         (ClientPhase::Playing, KeyCode::Right) => {
                             input_tracker.right = Some(Instant::now())
                         }
+                        (ClientPhase::Playing, KeyCode::Char(' '))
+                            if key.kind == KeyEventKind::Press =>
+                        {
+                            input_tracker.jump = Some(Instant::now())
+                        }
                         _ => {}
                     }
                 }
@@ -261,6 +345,7 @@ async fn run_client(
                             KeyCode::Down => input_tracker.down = None,
                             KeyCode::Left => input_tracker.left = None,
                             KeyCode::Right => input_tracker.right = None,
+                            KeyCode::Char(' ') => input_tracker.jump = None,
                             _ => {}
                         }
                     }
@@ -274,7 +359,7 @@ async fn run_client(
 
         if matches!(phase, ClientPhase::Playing) {
             let input = input_tracker.current();
-            let input_active = input.up || input.down || input.left || input.right;
+            let input_active = input.up || input.down || input.left || input.right || input.jump;
             if input != last_sent
                 || (input_active && last_input_send.elapsed() >= Duration::from_millis(50))
             {
@@ -284,6 +369,7 @@ async fn run_client(
                         down: input.down,
                         left: input.left,
                         right: input.right,
+                        jump: input.jump,
                         camera_up: camera.up.to_array(),
                     });
                 }
@@ -319,7 +405,7 @@ async fn run_client(
         }
 
         if let ClientPhase::Welcome { started } = phase {
-            if started.elapsed() >= Duration::from_millis(900) {
+            if started.elapsed() >= Duration::from_secs(5) {
                 phase = ClientPhase::Collapsing {
                     started: Instant::now(),
                 };
@@ -332,16 +418,32 @@ async fn run_client(
                     .game_api_token
                     .as_deref()
                     .context("missing game API token")?;
-                let (joined_state, tx) = start_player_connection(&backend_url, token).await?;
-                active_state = joined_state;
-                player_tx = Some(tx);
-                token_worker = Some(TokenScanWorker::start(
-                    detected.clone(),
-                    state.enabled_ai_tools.clone(),
-                    state.ai_usage_baseline.clone(),
-                ));
-                phase = ClientPhase::Playing;
-                renderer.reset();
+                match start_player_connection(&backend_url, token).await {
+                    Ok((joined_state, tx)) => {
+                        active_state = joined_state;
+                        player_tx = Some(tx);
+                        token_worker = Some(TokenScanWorker::start(
+                            detected.clone(),
+                            state.enabled_ai_tools.clone(),
+                            state.ai_usage_baseline.clone(),
+                        ));
+                        phase = ClientPhase::Playing;
+                        renderer.reset();
+                    }
+                    Err(error) if is_auth_rejected(&error) => {
+                        state.game_api_token = None;
+                        state.x_username = None;
+                        state.x_name = None;
+                        state.onboarding_completed = false;
+                        save_state(&state_path, &state)?;
+                        if let Some(spectator_state) = start_spectator(&backend_url).await {
+                            active_state = spectator_state;
+                        }
+                        phase = ClientPhase::Onboarding;
+                        renderer.reset();
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
 
@@ -351,13 +453,40 @@ async fn run_client(
                     token_delta = snapshot;
                 }
             }
+            let token_total = token_delta.total_tokens();
+            if matches!(phase, ClientPhase::Playing)
+                && (last_reported_tokens != Some(token_total)
+                    || last_token_report.elapsed() >= Duration::from_secs(2))
+            {
+                if let Some(tx) = &player_tx {
+                    let _ = tx.send(ClientMessage::TokenUsage {
+                        total_tokens: token_total,
+                    });
+                    last_reported_tokens = Some(token_total);
+                    last_token_report = Instant::now();
+                }
+            }
             let (cols, rows) = terminal::size()?;
             let live_state = active_state
                 .lock()
                 .map(|state| state.clone())
                 .unwrap_or_default();
             let visible = VisibleGameState::from_client_state(&live_state, &mut camera, cols, rows);
-            let transient_panel = match phase {
+            let gameplay_panel = if matches!(phase, ClientPhase::Playing) && market_open {
+                Some(UiPanel::market(
+                    &live_state.market,
+                    live_state.self_player(),
+                    market_selected,
+                ))
+            } else if matches!(phase, ClientPhase::Playing)
+                && !reward_dialog_closed
+                && !live_state.rewards.is_empty()
+            {
+                Some(UiPanel::rewards(&live_state.rewards))
+            } else {
+                None
+            };
+            let transient_panel = match &phase {
                 ClientPhase::XLoginPending { .. } => Some(UiPanel::x_login_pending()),
                 ClientPhase::Welcome { .. } => {
                     let name = state
@@ -378,10 +507,8 @@ async fn run_client(
                     let t = (started.elapsed().as_secs_f64() / 0.42).clamp(0.0, 1.0);
                     Some((&onboarding_panel, t))
                 }
-                ClientPhase::Playing => None,
+                ClientPhase::Playing => gameplay_panel.as_ref().map(|panel| (panel, 0.0)),
             };
-            let mut visible = visible;
-            visible.token_delta = token_delta.total_tokens();
             let actions = renderer.render_app(&visible, panel_progress);
             apply_ansi_actions(&actions)?;
             last_frame = Instant::now();
@@ -446,9 +573,15 @@ async fn start_player_connection(
                 continue;
             };
             match serde_json::from_str::<ServerMessage>(&text) {
-                Ok(ServerMessage::Welcome { self_id }) => {
+                Ok(ServerMessage::Welcome {
+                    self_id,
+                    rewards,
+                    market,
+                }) => {
                     if let Ok(mut state) = reader_state.lock() {
                         state.self_id = Some(self_id);
+                        state.rewards = rewards;
+                        state.market = market;
                     }
                 }
                 Ok(ServerMessage::Snapshot(snapshot)) => {
@@ -474,6 +607,13 @@ async fn start_player_connection(
     });
 
     Ok((shared, tx))
+}
+
+fn is_auth_rejected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("401") || message.contains("Unauthorized")
+    })
 }
 
 async fn start_x_login(backend_url: &str) -> anyhow::Result<LoginStartResponse> {
@@ -631,7 +771,13 @@ fn current_asset_name() -> Option<&'static str> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    Welcome { self_id: String },
+    Welcome {
+        self_id: String,
+        #[serde(default)]
+        rewards: Vec<RewardNotice>,
+        #[serde(default)]
+        market: Vec<MarketItem>,
+    },
     Snapshot(Snapshot),
 }
 
@@ -643,7 +789,17 @@ enum ClientMessage {
         down: bool,
         left: bool,
         right: bool,
+        jump: bool,
         camera_up: [f64; 3],
+    },
+    TokenUsage {
+        total_tokens: u64,
+    },
+    BuyHead {
+        item_id: String,
+    },
+    EquipHead {
+        item_id: String,
     },
 }
 
@@ -665,7 +821,38 @@ struct PlayerSnapshot {
     #[serde(default)]
     basis_up: Option<[f64; 3]>,
     fake: bool,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    lobsters: u64,
+    #[serde(default)]
+    lobster_yield_per_hour: f64,
+    #[serde(default = "default_head")]
+    equipped_head: String,
+    #[serde(default)]
+    owned_heads: Vec<String>,
+    #[serde(default)]
+    jump_height: f64,
     walking_phase: u64,
+}
+
+fn default_head() -> String {
+    "default".to_string()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RewardNotice {
+    label: String,
+    lobsters: u64,
+    streak: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct MarketItem {
+    id: String,
+    label: String,
+    head: String,
+    price_lobsters: u64,
 }
 
 impl PlayerSnapshot {
@@ -693,6 +880,19 @@ impl PlayerSnapshot {
 struct ClientGameState {
     self_id: Option<String>,
     snapshot: Option<Snapshot>,
+    rewards: Vec<RewardNotice>,
+    market: Vec<MarketItem>,
+}
+
+impl ClientGameState {
+    fn self_player(&self) -> Option<&PlayerSnapshot> {
+        let self_id = self.self_id.as_ref()?;
+        self.snapshot
+            .as_ref()?
+            .players
+            .iter()
+            .find(|player| &player.id == self_id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -701,6 +901,7 @@ struct InputState {
     down: bool,
     left: bool,
     right: bool,
+    jump: bool,
 }
 
 #[derive(Debug, Default)]
@@ -709,6 +910,7 @@ struct InputTracker {
     down: Option<Instant>,
     left: Option<Instant>,
     right: Option<Instant>,
+    jump: Option<Instant>,
 }
 
 impl InputTracker {
@@ -731,6 +933,7 @@ impl InputTracker {
             down: active(&mut self.down),
             left: active(&mut self.left),
             right: active(&mut self.right),
+            jump: active(&mut self.jump),
         }
     }
 }
@@ -853,6 +1056,8 @@ struct VisibleGameState {
     camera_focus: Vec3,
     camera_up: Vec3,
     token_delta: u64,
+    lobsters: u64,
+    lobster_yield_per_hour: f64,
     players: Vec<VisiblePlayer>,
 }
 
@@ -862,6 +1067,11 @@ struct VisiblePlayer {
     position: Vec3,
     is_self: bool,
     is_fake: bool,
+    points: u64,
+    lobsters: u64,
+    lobster_yield_per_hour: f64,
+    equipped_head: String,
+    jump_height: f64,
     walking_phase: u64,
 }
 
@@ -916,33 +1126,72 @@ impl VisibleGameState {
                 .normalize();
         }
 
-        let players = snapshot
+        let players: Vec<VisiblePlayer> = snapshot
             .players
             .iter()
             .filter(|player| player.planet_id == 0)
-            .map(|player| VisiblePlayer {
-                name: player.name.clone(),
-                position: player.position_vec(),
-                is_self: state
-                    .self_id
-                    .as_ref()
-                    .map(|self_id| self_id == &player.id)
-                    .unwrap_or(false),
-                is_fake: player.fake,
-                walking_phase: player.walking_phase,
+            .map(|player| {
+                let equipped_head = equipped_head_glyph(&player.equipped_head).to_string();
+                VisiblePlayer {
+                    name: player.name.clone(),
+                    position: player.position_vec(),
+                    is_self: state
+                        .self_id
+                        .as_ref()
+                        .map(|self_id| self_id == &player.id)
+                        .unwrap_or(false),
+                    is_fake: player.fake,
+                    points: player.total_tokens,
+                    lobsters: player.lobsters,
+                    lobster_yield_per_hour: player.lobster_yield_per_hour,
+                    equipped_head,
+                    jump_height: player.jump_height,
+                    walking_phase: player.walking_phase,
+                }
             })
             .collect();
+        let self_economy = players
+            .iter()
+            .find(|player: &&VisiblePlayer| player.is_self)
+            .map(|player| {
+                (
+                    player.lobsters,
+                    player.lobster_yield_per_hour,
+                    player.points,
+                )
+            })
+            .unwrap_or((0, 0.0, 0));
 
         Self {
             width,
             height,
-            planet_diameter_cells: 67.5,
+            planet_diameter_cells: 101.25,
             camera_focus: camera.focus,
             camera_up: camera.up,
-            token_delta: 0,
+            token_delta: self_economy.2,
+            lobsters: self_economy.0,
+            lobster_yield_per_hour: self_economy.1,
             players,
         }
     }
+}
+
+fn builtin_head(id: &str) -> &str {
+    match id {
+        "default" => "0",
+        "box" => "📦",
+        "smile" => "🙂",
+        "cowboy" => "🤠",
+        "sunglasses" => "😎",
+        "frog" => "🐸",
+        "lobster" => "🦞",
+        "sun" => "☀️",
+        other => other,
+    }
+}
+
+fn equipped_head_glyph(id: &str) -> &str {
+    builtin_head(id)
 }
 
 #[derive(Debug, Clone)]
@@ -965,6 +1214,9 @@ const PLANET_WATER: Color = Color(45, 75, 110);
 const PLAYER_SELF: Color = Color(170, 235, 170);
 const PLAYER_OTHER: Color = Color(255, 190, 125);
 const HUD: Color = Color(120, 120, 120);
+const STAR_DIM: Color = Color(70, 76, 92);
+const STAR_MID: Color = Color(105, 114, 135);
+const STAR_BRIGHT: Color = Color(155, 166, 190);
 const FG: Color = Color(245, 245, 245);
 const FG_DIM: Color = Color(190, 190, 190);
 const FG_V_DIM: Color = Color(120, 120, 120);
@@ -1134,7 +1386,7 @@ impl UiPanel {
                 lines: vec!["No supported local token source.".to_string()],
             });
             return Self {
-                title: "Welcome to Tokenizers".to_string(),
+                title: "Welcome to Ascii World".to_string(),
                 blocks,
                 prompt: Some("No supported token source was found. Press Escape.".to_string()),
             };
@@ -1144,7 +1396,7 @@ impl UiPanel {
             columns: vec![
                 "AI tool".to_string(),
                 "records".to_string(),
-                "what Tokenizers can read".to_string(),
+                "what Ascii World can read".to_string(),
             ],
             rows: detected
                 .iter()
@@ -1164,7 +1416,7 @@ impl UiPanel {
         });
 
         Self {
-            title: "Welcome to Tokenizers".to_string(),
+            title: "Welcome to Ascii World".to_string(),
             blocks,
             prompt: Some(">> Press Enter to log in with X <<".to_string()),
         }
@@ -1178,7 +1430,6 @@ impl UiPanel {
                 lines: vec![
                     "A browser window opened for X login.".to_string(),
                     "Complete the login there, then return to this terminal.".to_string(),
-                    "The planet stays live while Tokenizers waits.".to_string(),
                 ],
             }],
             prompt: Some("Finish login in your browser, or press Escape to quit.".to_string()),
@@ -1192,10 +1443,91 @@ impl UiPanel {
                 color: ACCENT_1,
                 lines: vec![
                     "Your player profile is connected.".to_string(),
-                    "Tokenizers is joining the multiplayer world now.".to_string(),
+                    "Ascii World is joining the multiplayer world now.".to_string(),
                 ],
             }],
             prompt: None,
+        }
+    }
+
+    fn rewards(rewards: &[RewardNotice]) -> Self {
+        let mut lines = vec!["Check-in rewards claimed:".to_string()];
+        for reward in rewards {
+            lines.push(format!(
+                "{}: +{} (streak {})",
+                reward.label,
+                format_lobsters(reward.lobsters),
+                reward.streak
+            ));
+        }
+        lines.push("Daily: 1000 plus 1000 per streak day.".to_string());
+        lines.push("Weekly: 5000 per streak week.".to_string());
+
+        Self {
+            title: "Rewards".to_string(),
+            blocks: vec![UiBlock::Paragraph {
+                lines,
+                color: ACCENT_1,
+            }],
+            prompt: Some("Press Enter to close.".to_string()),
+        }
+    }
+
+    fn market(items: &[MarketItem], self_player: Option<&PlayerSnapshot>, selected: usize) -> Self {
+        let balance = self_player.map(|player| player.lobsters).unwrap_or(0);
+        let owned = self_player
+            .map(|player| player.owned_heads.as_slice())
+            .unwrap_or(&[]);
+        let equipped = self_player
+            .map(|player| player.equipped_head.as_str())
+            .unwrap_or("default");
+        let rows = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let is_owned = owned.iter().any(|owned| owned == &item.id);
+                let is_equipped = equipped == item.id;
+                let action = if is_equipped {
+                    "equipped"
+                } else if is_owned {
+                    "owned"
+                } else if balance >= item.price_lobsters {
+                    "buy"
+                } else {
+                    "locked"
+                };
+                UiRow {
+                    cells: vec![
+                        if index == selected { ">" } else { " " }.to_string(),
+                        item.head.clone(),
+                        item.label.clone(),
+                        format_lobsters(item.price_lobsters),
+                        action.to_string(),
+                    ],
+                    color: if index == selected {
+                        ACCENT_1
+                    } else if is_owned {
+                        FG
+                    } else {
+                        FG_DIM
+                    },
+                }
+            })
+            .collect();
+
+        Self {
+            title: format!("Market  balance {}", format_lobsters(balance)),
+            blocks: vec![UiBlock::Table {
+                columns: vec![
+                    "".to_string(),
+                    "head".to_string(),
+                    "item".to_string(),
+                    "price".to_string(),
+                    "state".to_string(),
+                ],
+                rows,
+            }],
+            prompt: Some("Up/down select, Enter buy/equip, M close.".to_string()),
         }
     }
 }
@@ -1387,6 +1719,14 @@ fn draw_block(
 }
 
 fn format_table_row(cells: &[String]) -> String {
+    if cells.len() == 5 {
+        let marker = cells.first().map(String::as_str).unwrap_or("");
+        let head = cells.get(1).map(String::as_str).unwrap_or("");
+        let item = cells.get(2).map(String::as_str).unwrap_or("");
+        let price = cells.get(3).map(String::as_str).unwrap_or("");
+        let state = cells.get(4).map(String::as_str).unwrap_or("");
+        return format!("{marker:<1}  {head:<3}  {item:<12}  {price:>9}  {state:<8}");
+    }
     let first = cells.first().map(String::as_str).unwrap_or("");
     let second = cells.get(1).map(String::as_str).unwrap_or("");
     let third = cells.get(2).map(String::as_str).unwrap_or("");
@@ -1442,6 +1782,7 @@ fn render_game_frame(state: &VisibleGameState) -> FrameBuffer {
     let width = state.width.max(1);
     let height = state.height.max(1);
     let mut frame = FrameBuffer::new(width, height);
+    draw_starfield(&mut frame);
     let cx = width as f64 / 2.0;
     let cy = height as f64 / 2.0;
     let radius_x = (state.planet_diameter_cells / 2.0).min((width as f64 - 4.0).max(4.0) / 2.0);
@@ -1496,13 +1837,191 @@ fn render_game_frame(state: &VisibleGameState) -> FrameBuffer {
         draw_player(&mut frame, sx, sy, player);
     }
 
-    frame.text(
-        0,
-        0,
-        &format!("arrows move, esc exits   tokens +{}", state.token_delta),
-        HUD,
+    frame.text(0, 0, "arrows move, space jumps, M market, esc exits", HUD);
+    let economy = format!(
+        "tokens {}  yield {}/h  balance {}",
+        format_tokens(state.token_delta),
+        format_lobsters_per_hour(state.lobster_yield_per_hour),
+        format_lobsters(state.lobsters)
     );
+    let economy_x = width as i32 - economy.chars().count() as i32 - 1;
+    frame.text(economy_x.max(0), 0, &economy, HUD);
     frame
+}
+
+fn draw_starfield(frame: &mut FrameBuffer) {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            let seed = hash_coords(x as i32, y as i32, 0x5f3759df);
+            let placement = unit_from_hash(seed);
+            let large = placement < 0.0022;
+            let small = placement < 0.019;
+            if !large && !small {
+                continue;
+            }
+
+            if large {
+                let phase = unit_from_hash(seed ^ 0x9e3779b9) * 12.0;
+                let noise = perlin3(x as f64 * 0.075, y as f64 * 0.12, time * 0.18 + phase);
+                let level = (((noise + 1.0) * 1.5).floor() as i32).clamp(0, 2);
+                let (ch, color) = match level {
+                    0 => ('+', STAR_MID),
+                    1 => ('*', STAR_MID),
+                    _ => ('*', STAR_BRIGHT),
+                };
+                frame.put(x as i32, y as i32, ch, color);
+            } else {
+                let color = if placement < 0.006 {
+                    STAR_MID
+                } else {
+                    STAR_DIM
+                };
+                frame.put(x as i32, y as i32, '.', color);
+            }
+        }
+    }
+}
+
+fn perlin3(x: f64, y: f64, z: f64) -> f64 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let zi = z.floor() as i32;
+    let xf = x - xi as f64;
+    let yf = y - yi as f64;
+    let zf = z - zi as f64;
+    let u = perlin_fade(xf);
+    let v = perlin_fade(yf);
+    let w = perlin_fade(zf);
+
+    let n000 = gradient_dot(xi, yi, zi, xf, yf, zf);
+    let n100 = gradient_dot(xi + 1, yi, zi, xf - 1.0, yf, zf);
+    let n010 = gradient_dot(xi, yi + 1, zi, xf, yf - 1.0, zf);
+    let n110 = gradient_dot(xi + 1, yi + 1, zi, xf - 1.0, yf - 1.0, zf);
+    let n001 = gradient_dot(xi, yi, zi + 1, xf, yf, zf - 1.0);
+    let n101 = gradient_dot(xi + 1, yi, zi + 1, xf - 1.0, yf, zf - 1.0);
+    let n011 = gradient_dot(xi, yi + 1, zi + 1, xf, yf - 1.0, zf - 1.0);
+    let n111 = gradient_dot(xi + 1, yi + 1, zi + 1, xf - 1.0, yf - 1.0, zf - 1.0);
+
+    let x00 = lerp(n000, n100, u);
+    let x10 = lerp(n010, n110, u);
+    let x01 = lerp(n001, n101, u);
+    let x11 = lerp(n011, n111, u);
+    let y0 = lerp(x00, x10, v);
+    let y1 = lerp(x01, x11, v);
+    lerp(y0, y1, w).clamp(-1.0, 1.0)
+}
+
+fn gradient_dot(ix: i32, iy: i32, iz: i32, x: f64, y: f64, z: f64) -> f64 {
+    (match hash_coords3(ix, iy, iz) & 15 {
+        0 => x + y,
+        1 => -x + y,
+        2 => x - y,
+        3 => -x - y,
+        4 => x + z,
+        5 => -x + z,
+        6 => x - z,
+        7 => -x - z,
+        8 => y + z,
+        9 => -y + z,
+        10 => y - z,
+        11 => -y - z,
+        12 => x + y,
+        13 => -x + y,
+        14 => -y + z,
+        _ => -y - z,
+    }) * 0.7071067811865475
+}
+
+fn perlin_fade(t: f64) -> f64 {
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    a + (b - a) * t
+}
+
+fn hash_coords(x: i32, y: i32, seed: u32) -> u32 {
+    hash_mix((x as u32).wrapping_mul(0x8da6b343) ^ (y as u32).wrapping_mul(0xd8163841) ^ seed)
+}
+
+fn hash_coords3(x: i32, y: i32, z: i32) -> u32 {
+    hash_mix(
+        (x as u32).wrapping_mul(0x8da6b343)
+            ^ (y as u32).wrapping_mul(0xd8163841)
+            ^ (z as u32).wrapping_mul(0xcb1ab31f),
+    )
+}
+
+fn hash_mix(mut value: u32) -> u32 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846ca68b);
+    value ^ (value >> 16)
+}
+
+fn unit_from_hash(value: u32) -> f64 {
+    value as f64 / u32::MAX as f64
+}
+
+fn format_count(value: u64) -> String {
+    let (scaled, suffix) = if value >= 1_000_000_000 {
+        (value as f64 / 1_000_000_000.0, "B")
+    } else if value >= 1_000_000 {
+        (value as f64 / 1_000_000.0, "M")
+    } else if value >= 1_000 {
+        (value as f64 / 1_000.0, "k")
+    } else {
+        return value.to_string();
+    };
+
+    let tenths = (scaled * 10.0).round() as u64;
+    if tenths % 10 == 0 {
+        format!("{}{suffix}", tenths / 10)
+    } else {
+        format!("{}.{}{suffix}", tenths / 10, tenths % 10)
+    }
+}
+
+fn format_tokens(tokens: u64) -> String {
+    format_count(tokens)
+}
+
+fn format_token_points(tokens: u64) -> String {
+    format!("Ŧ{}", format_count(tokens))
+}
+
+fn format_lobsters(lobsters: u64) -> String {
+    format!("🦞{}", format_count(lobsters))
+}
+
+fn format_lobsters_per_hour(lobsters_per_hour: f64) -> String {
+    format!("🦞{}", format_rate(lobsters_per_hour))
+}
+
+fn format_rate(value: f64) -> String {
+    let value = if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    };
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let rounded = (value * 1_000.0).round() / 1_000.0;
+    let mut text = format!("{rounded:.3}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
 }
 
 fn earth_land(position: Vec3) -> bool {
@@ -1537,23 +2056,50 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
     } else {
         Color(245, 245, 245)
     };
-    let leg = match player.walking_phase % 3 {
-        0 => "/",
-        1 => "|",
-        _ => "\\",
+    let legs = match player.walking_phase % 4 {
+        0 => "|\\",
+        1 => "\\|",
+        2 => "/|",
+        _ => "||",
     };
+    let lift = player.jump_height.ceil().clamp(0.0, 2.0) as i32;
+    if lift > 0 {
+        let shadow = if player.jump_height > 1.2 {
+            " . "
+        } else {
+            "..."
+        };
+        frame.text(x - 1, y, shadow, FG_V_DIM);
+    }
+    let body_y = y - lift;
+    let head = if player.equipped_head.trim().is_empty() {
+        "0"
+    } else {
+        player.equipped_head.as_str()
+    };
+    let head_row = if head.is_ascii() {
+        format!(" {head} ")
+    } else {
+        format!("{head} ")
+    };
+    let head_x = if head.is_ascii() { x - 1 } else { x };
     let rows = [
-        (0, " 0 ".to_string()),
-        (1, "-|-".to_string()),
-        (2, format!(" |{leg}")),
+        (0, head_x, head_row),
+        (1, x - 1, "-|-".to_string()),
+        (2, x - 1, format!(" {legs}")),
     ];
-    for (dy, text) in rows {
-        frame.text(x - 1, y - 2 + dy, &text, color);
+    for (dy, row_x, text) in rows {
+        frame.text(row_x, body_y - 2 + dy, &text, color);
     }
     if !player.name.is_empty() {
         let label = format!("@{}", player.name);
         let label_x = x - (label.chars().count() as i32 / 2);
-        frame.text(label_x, y - 3, &label, HUD);
+        if player.is_self {
+            let points = format_token_points(player.points);
+            let points_x = x - (points.chars().count() as i32 / 2);
+            frame.text(points_x, body_y - 4, &points, ACCENT_1);
+        }
+        frame.text(label_x, body_y - 3, &label, HUD);
     }
 }
 
@@ -2203,5 +2749,35 @@ mod ai_usage {
         env::var_os(var)
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_and_lobsters_are_abbreviated() {
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(7_500), "7.5k");
+        assert_eq!(format_count(10_000), "10k");
+        assert_eq!(format_count(10_500), "10.5k");
+        assert_eq!(format_count(10_000_000), "10M");
+        assert_eq!(format_count(10_500_000), "10.5M");
+        assert_eq!(format_token_points(10_500_000), "Ŧ10.5M");
+        assert_eq!(format_lobsters(10_000_000_000), "🦞10B");
+        assert_eq!(format_lobsters_per_hour(0.0), "🦞0");
+        assert_eq!(format_lobsters_per_hour(0.06), "🦞0.06");
+        assert_eq!(format_lobsters_per_hour(0.0014), "🦞0.001");
+        assert_eq!(format_lobsters_per_hour(7.5), "🦞7.5");
+        assert_eq!(builtin_head("default"), "0");
+        assert_eq!(builtin_head("box"), "📦");
+        assert_eq!(equipped_head_glyph("default"), "0");
+    }
+
+    #[test]
+    fn websocket_unauthorized_is_auth_rejected_through_error_chain() {
+        let error = anyhow!("HTTP error: 401 Unauthorized").context("failed to connect websocket");
+        assert!(is_auth_rejected(&error));
     }
 }

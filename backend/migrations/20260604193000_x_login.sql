@@ -20,3 +20,14 @@ CREATE TABLE IF NOT EXISTS x_login_sessions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS total_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS lobster_micros BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS last_lobster_at TIMESTAMPTZ;
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS last_daily_reward_date DATE;
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS daily_streak_days INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS last_weekly_reward_monday DATE;
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS weekly_streak_weeks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS equipped_head TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS owned_heads JSONB NOT NULL DEFAULT '["default"]'::jsonb;
+UPDATE game_users SET equipped_head = 'default' WHERE equipped_head = 'box';
