@@ -1,0 +1,155 @@
+name: Release Game CLI
+
+on:
+  push:
+    tags:
+      - 'game-cli-v*'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      package-version: ${{ steps.release-options.outputs.package-version }}
+      matrix: ${{ steps.release-options.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read release options
+        id: release-options
+        shell: bash
+        run: |
+          git fetch --force --tags
+          message="$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' || true)"
+          platform="$(printf '%s\n' "$message" | awk -F= '/^platform=/{print $2; exit}')"
+          package_version="$(printf '%s\n' "$message" | awk -F= '/^version=/{print $2; exit}')"
+          if [ -z "$platform" ]; then platform="all"; fi
+          if [ -z "$package_version" ]; then package_version="${GITHUB_REF_NAME#game-cli-v}"; fi
+          case "$platform" in
+            all)
+              matrix='{"include":[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","asset":"game-linux-x64","platform":"linux-x64"},{"os":"ubuntu-latest","target":"aarch64-unknown-linux-musl","asset":"game-linux-arm64","platform":"linux-arm64"},{"os":"macos-latest","target":"x86_64-apple-darwin","asset":"game-darwin-x64","platform":"darwin-x64"},{"os":"macos-latest","target":"aarch64-apple-darwin","asset":"game-darwin-arm64","platform":"darwin-arm64"},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","asset":"game-windows-x64.exe","platform":"windows-x64"}]}'
+              ;;
+            linux-x64)
+              matrix='{"include":[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","asset":"game-linux-x64","platform":"linux-x64"}]}'
+              ;;
+            linux-arm64)
+              matrix='{"include":[{"os":"ubuntu-latest","target":"aarch64-unknown-linux-musl","asset":"game-linux-arm64","platform":"linux-arm64"}]}'
+              ;;
+            darwin-x64)
+              matrix='{"include":[{"os":"macos-latest","target":"x86_64-apple-darwin","asset":"game-darwin-x64","platform":"darwin-x64"}]}'
+              ;;
+            darwin-arm64)
+              matrix='{"include":[{"os":"macos-latest","target":"aarch64-apple-darwin","asset":"game-darwin-arm64","platform":"darwin-arm64"}]}'
+              ;;
+            windows-x64)
+              matrix='{"include":[{"os":"windows-latest","target":"x86_64-pc-windows-msvc","asset":"game-windows-x64.exe","platform":"windows-x64"}]}'
+              ;;
+            *)
+              echo "Invalid platform: $platform" >&2
+              exit 2
+              ;;
+          esac
+          echo "package-version=$package_version" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set package version
+        shell: bash
+        run: |
+          tmp="$(mktemp)"
+          awk -v version="${{ needs.prepare.outputs.package-version }}" '
+            !done && /^version = "/ {
+              print "version = \"" version "\""
+              done = 1
+              next
+            }
+            { print }
+          ' cli/Cargo.toml > "$tmp"
+          mv "$tmp" cli/Cargo.toml
+          cargo update --manifest-path cli/Cargo.toml -p cli
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Install Linux cross tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Configure aarch64 musl linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-musl]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build
+        env:
+          GAME_ENV: production
+          GAME_CLI_REPO: ${{ github.repository }}
+          GAME_BACKEND_URL: ${{ vars.GAME_BACKEND_URL }}
+        run: cargo build --manifest-path cli/Cargo.toml --release --target ${{ matrix.target }}
+
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp cli/target/${{ matrix.target }}/release/game dist/${{ matrix.asset }}
+          chmod +x dist/${{ matrix.asset }}
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "cli/target/${{ matrix.target }}/release/game.exe" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            release-files/* \
+            cli/install.sh \
+            cli/install.ps1 \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "Game CLI release ${{ github.ref_name }}"

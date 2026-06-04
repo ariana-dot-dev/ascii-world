@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS schema_migrations_marker (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS server_boots (
+  id UUID PRIMARY KEY,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
