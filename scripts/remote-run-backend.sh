@@ -51,7 +51,7 @@ done
 
 curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
 
-host "$PORT" --title "Ascii game backend" > "$APP_DIR/logs/host.log" 2>&1 || true
-host url "$PORT" > "$APP_DIR/.box-host-url"
+host "$PORT" --public --title "Ascii game backend" > "$APP_DIR/logs/host.log" 2>&1 || true
+awk '/^https:\/\// { print $1; exit }' "$APP_DIR/logs/host.log" > "$APP_DIR/.box-host-url"
 
 test -s "$APP_DIR/.box-host-url"

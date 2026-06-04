@@ -127,6 +127,12 @@ print("" if value is None else value)
 ' "$path"
 }
 
+shell_quote() {
+  python3 -c 'import shlex, sys
+print(shlex.quote(sys.argv[1]))
+' "${1:-}"
+}
+
 box_patch_body() {
   python3 -c 'import json, os
 print(json.dumps({"name": os.environ["BOX_NAME"], "ttlSeconds": None}))
@@ -224,6 +230,9 @@ mkdir -p /opt/ascii-game
 tar -xzf /tmp/ascii-game.tgz -C /opt/ascii-game
 cd /opt/ascii-game
 chmod +x scripts/remote-run-backend.sh
+export X_CLIENT_ID=$(shell_quote "${X_CLIENT_ID:-${X_CONSUMER_KEY:-}}")
+export X_CLIENT_SECRET=$(shell_quote "${X_CLIENT_SECRET:-${X_CONSUMER_SECRET:-}}")
+export X_BEARER_TOKEN=$(shell_quote "${X_BEARER_TOKEN:-}")
 RESET_DB=$RESET_DB PORT=$PORT ./scripts/remote-run-backend.sh
 EOF
 
@@ -235,11 +244,13 @@ fi
 
 tmp_env="$(mktemp)"
 if [ -f "$CLI_ENV_FILE" ]; then
-  grep -v '^GAME_BACKEND_URL=' "$CLI_ENV_FILE" > "$tmp_env" || true
+  grep -v -E '^(GAME_BACKEND_URL|GAME_ENV)=' "$CLI_ENV_FILE" > "$tmp_env" || true
 fi
 printf 'GAME_BACKEND_URL=%s\n' "$host_url" >> "$tmp_env"
 if [ "$ENVIRONMENT" = "prod" ]; then
-  grep -q '^GAME_ENV=' "$tmp_env" 2>/dev/null || printf 'GAME_ENV=production\n' >> "$tmp_env"
+  printf 'GAME_ENV=production\n' >> "$tmp_env"
+else
+  printf 'GAME_ENV=development\n' >> "$tmp_env"
 fi
 mv "$tmp_env" "$CLI_ENV_FILE"
 
