@@ -30,4 +30,5 @@ ALTER TABLE game_users ADD COLUMN IF NOT EXISTS last_weekly_reward_monday DATE;
 ALTER TABLE game_users ADD COLUMN IF NOT EXISTS weekly_streak_weeks INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE game_users ADD COLUMN IF NOT EXISTS equipped_head TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE game_users ADD COLUMN IF NOT EXISTS owned_heads JSONB NOT NULL DEFAULT '["default"]'::jsonb;
+ALTER TABLE game_users ADD COLUMN IF NOT EXISTS owned_pixels JSONB NOT NULL DEFAULT '[0,0,0,0,0]'::jsonb;
 UPDATE game_users SET equipped_head = 'default' WHERE equipped_head = 'box';

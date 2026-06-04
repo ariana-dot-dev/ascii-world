@@ -5,7 +5,7 @@ edition.workspace = true
 build = "build.rs"
 
 [[bin]]
-name = "game"
+name = "world"
 path = "src/main.rs"
 
 [dependencies]

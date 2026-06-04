@@ -28,6 +28,9 @@ use walkdir::WalkDir;
 mod land_mask;
 
 const ONBOARDING_VERSION: u32 = 3;
+const PIXEL_COLOR_COUNT: usize = 5;
+const FOOTER_TEXT: &str =
+    "Made and hosted by agents on https://box.ascii.dev, the cheapest and most powerful AI sandboxes";
 
 #[derive(Parser)]
 #[command(name = "Ascii World", version, about = "Multiplayer token game")]
@@ -91,9 +94,6 @@ enum ClientPhase {
         next_poll: Instant,
     },
     Welcome {
-        started: Instant,
-    },
-    Collapsing {
         started: Instant,
     },
     Playing,
@@ -216,8 +216,10 @@ async fn run_client(
     let mut last_reported_tokens: Option<u64> = None;
     let mut last_token_report = Instant::now() - Duration::from_secs(5);
     let mut reward_dialog_closed = false;
+    let mut reward_dialog_opened_at: Option<Instant> = None;
     let mut market_open = false;
     let mut market_selected = 0usize;
+    let mut selected_pixel_color = 0usize;
     let onboarding_panel = UiPanel::onboarding(&detected);
 
     loop {
@@ -247,18 +249,24 @@ async fn run_client(
                                 if let Some(item) = live_state.market.get(market_selected) {
                                     if let Some(self_player) = live_state.self_player() {
                                         if let Some(tx) = &player_tx {
-                                            let owned = self_player
-                                                .owned_heads
-                                                .iter()
-                                                .any(|owned| owned == &item.id);
-                                            let equipped = self_player.equipped_head == item.id;
-                                            let _ = if owned && !equipped {
-                                                tx.send(ClientMessage::EquipHead {
-                                                    item_id: item.id.clone(),
+                                            let _ = if item.kind == "pixel" {
+                                                item.pixel_color.map(|color| {
+                                                    tx.send(ClientMessage::BuyPixel { color })
                                                 })
                                             } else {
-                                                tx.send(ClientMessage::BuyHead {
-                                                    item_id: item.id.clone(),
+                                                let owned = self_player
+                                                    .owned_heads
+                                                    .iter()
+                                                    .any(|owned| owned == &item.id);
+                                                let equipped = self_player.equipped_head == item.id;
+                                                Some(if owned && !equipped {
+                                                    tx.send(ClientMessage::EquipHead {
+                                                        item_id: item.id.clone(),
+                                                    })
+                                                } else {
+                                                    tx.send(ClientMessage::BuyHead {
+                                                        item_id: item.id.clone(),
+                                                    })
                                                 })
                                             };
                                         }
@@ -274,8 +282,12 @@ async fn run_client(
                             .lock()
                             .map(|state| !state.rewards.is_empty())
                             .unwrap_or(false);
-                        if has_rewards && !reward_dialog_closed {
+                        let reward_can_close = reward_dialog_opened_at
+                            .map(|opened| opened.elapsed() >= Duration::from_secs(5))
+                            .unwrap_or(false);
+                        if has_rewards && !reward_dialog_closed && reward_can_close {
                             reward_dialog_closed = true;
+                            reward_dialog_opened_at = None;
                             renderer.reset();
                             continue;
                         }
@@ -318,6 +330,21 @@ async fn run_client(
                             market_selected = 0;
                             renderer.reset();
                         }
+                        (ClientPhase::Playing, KeyCode::Char(ch))
+                            if pixel_shortcut(ch).is_some() =>
+                        {
+                            if let Some(color) = pixel_shortcut(ch) {
+                                selected_pixel_color = color;
+                                renderer.reset();
+                            }
+                        }
+                        (ClientPhase::Playing, KeyCode::Char('p') | KeyCode::Char('P')) => {
+                            if let Some(tx) = &player_tx {
+                                let _ = tx.send(ClientMessage::PlacePixel {
+                                    color: selected_pixel_color,
+                                });
+                            }
+                        }
                         (ClientPhase::Playing, KeyCode::Up) => {
                             input_tracker.up = Some(Instant::now())
                         }
@@ -333,7 +360,20 @@ async fn run_client(
                         (ClientPhase::Playing, KeyCode::Char(' '))
                             if key.kind == KeyEventKind::Press =>
                         {
-                            input_tracker.jump = Some(Instant::now())
+                            input_tracker.jump = Some(Instant::now());
+                            if let Some(tx) = &player_tx {
+                                let input = input_tracker.current();
+                                let _ = tx.send(ClientMessage::Input {
+                                    up: input.up,
+                                    down: input.down,
+                                    left: input.left,
+                                    right: input.right,
+                                    jump: true,
+                                    camera_up: camera.up.to_array(),
+                                });
+                                last_sent = input;
+                                last_input_send = Instant::now();
+                            }
                         }
                         _ => {}
                     }
@@ -406,14 +446,6 @@ async fn run_client(
 
         if let ClientPhase::Welcome { started } = phase {
             if started.elapsed() >= Duration::from_secs(5) {
-                phase = ClientPhase::Collapsing {
-                    started: Instant::now(),
-                };
-            }
-        }
-
-        if let ClientPhase::Collapsing { started } = phase {
-            if started.elapsed() >= Duration::from_millis(420) {
                 let token = state
                     .game_api_token
                     .as_deref()
@@ -470,19 +502,32 @@ async fn run_client(
             let live_state = active_state
                 .lock()
                 .map(|state| state.clone())
-                .unwrap_or_default();
+                .map_err(|_| anyhow!("game state lock is poisoned"))?;
+            if let Some(error) = &live_state.protocol_error {
+                return Err(anyhow!(error.clone()));
+            }
+            let rewards_visible = matches!(phase, ClientPhase::Playing)
+                && !reward_dialog_closed
+                && !live_state.rewards.is_empty();
+            if rewards_visible && reward_dialog_opened_at.is_none() {
+                reward_dialog_opened_at = Some(Instant::now());
+            }
             let visible = VisibleGameState::from_client_state(&live_state, &mut camera, cols, rows);
+            let self_pixels = live_state
+                .self_player()
+                .map(|player| player.owned_pixels)
+                .unwrap_or([0; PIXEL_COLOR_COUNT]);
             let gameplay_panel = if matches!(phase, ClientPhase::Playing) && market_open {
                 Some(UiPanel::market(
                     &live_state.market,
                     live_state.self_player(),
                     market_selected,
                 ))
-            } else if matches!(phase, ClientPhase::Playing)
-                && !reward_dialog_closed
-                && !live_state.rewards.is_empty()
-            {
-                Some(UiPanel::rewards(&live_state.rewards))
+            } else if rewards_visible {
+                let can_close = reward_dialog_opened_at
+                    .map(|opened| opened.elapsed() >= Duration::from_secs(5))
+                    .unwrap_or(false);
+                Some(UiPanel::rewards(&live_state.rewards, can_close))
             } else {
                 None
             };
@@ -503,13 +548,10 @@ async fn run_client(
                 ClientPhase::XLoginPending { .. } | ClientPhase::Welcome { .. } => {
                     transient_panel.as_ref().map(|panel| (panel, 0.0))
                 }
-                ClientPhase::Collapsing { started } => {
-                    let t = (started.elapsed().as_secs_f64() / 0.42).clamp(0.0, 1.0);
-                    Some((&onboarding_panel, t))
-                }
                 ClientPhase::Playing => gameplay_panel.as_ref().map(|panel| (panel, 0.0)),
             };
-            let actions = renderer.render_app(&visible, panel_progress);
+            let actions =
+                renderer.render_app(&visible, panel_progress, selected_pixel_color, self_pixels);
             apply_ansi_actions(&actions)?;
             last_frame = Instant::now();
         }
@@ -539,12 +581,29 @@ async fn start_spectator(backend_url: &str) -> Option<Arc<Mutex<ClientGameState>
             let Ok(Message::Text(text)) = message else {
                 continue;
             };
-            if let Ok(ServerMessage::Snapshot(snapshot)) =
-                serde_json::from_str::<ServerMessage>(&text)
-            {
-                if let Ok(mut state) = reader_state.lock() {
-                    state.snapshot = Some(snapshot);
-                    state.self_id = None;
+            match serde_json::from_str::<ServerMessage>(&text) {
+                Ok(ServerMessage::Snapshot(snapshot)) => {
+                    let result = validate_snapshot(&snapshot);
+                    if let Ok(mut state) = reader_state.lock() {
+                        match result {
+                            Ok(()) => {
+                                state.snapshot = Some(snapshot);
+                                state.self_id = None;
+                            }
+                            Err(err) => state.protocol_error = Some(err.to_string()),
+                        }
+                    }
+                }
+                Ok(ServerMessage::Welcome { .. }) => {
+                    if let Ok(mut state) = reader_state.lock() {
+                        state.protocol_error =
+                            Some("backend sent welcome message on spectator websocket".to_string());
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut state) = reader_state.lock() {
+                        state.protocol_error = Some(format!("backend protocol error: {err}"));
+                    }
                 }
             }
         }
@@ -585,11 +644,19 @@ async fn start_player_connection(
                     }
                 }
                 Ok(ServerMessage::Snapshot(snapshot)) => {
+                    let result = validate_snapshot(&snapshot);
                     if let Ok(mut state) = reader_state.lock() {
-                        state.snapshot = Some(snapshot);
+                        match result {
+                            Ok(()) => state.snapshot = Some(snapshot),
+                            Err(err) => state.protocol_error = Some(err.to_string()),
+                        }
                     }
                 }
-                Err(_) => {}
+                Err(err) => {
+                    if let Ok(mut state) = reader_state.lock() {
+                        state.protocol_error = Some(format!("backend protocol error: {err}"));
+                    }
+                }
             }
         }
     });
@@ -759,11 +826,11 @@ async fn try_self_update() {
 
 fn current_asset_name() -> Option<&'static str> {
     match (env::consts::OS, env::consts::ARCH) {
-        ("linux", "x86_64") => Some("game-linux-x64"),
-        ("linux", "aarch64") => Some("game-linux-arm64"),
-        ("macos", "x86_64") => Some("game-darwin-x64"),
-        ("macos", "aarch64") => Some("game-darwin-arm64"),
-        ("windows", "x86_64") => Some("game-windows-x64.exe"),
+        ("linux", "x86_64") => Some("world-linux-x64"),
+        ("linux", "aarch64") => Some("world-linux-arm64"),
+        ("macos", "x86_64") => Some("world-darwin-x64"),
+        ("macos", "aarch64") => Some("world-darwin-arm64"),
+        ("windows", "x86_64") => Some("world-windows-x64.exe"),
         _ => None,
     }
 }
@@ -773,9 +840,7 @@ fn current_asset_name() -> Option<&'static str> {
 enum ServerMessage {
     Welcome {
         self_id: String,
-        #[serde(default)]
         rewards: Vec<RewardNotice>,
-        #[serde(default)]
         market: Vec<MarketItem>,
     },
     Snapshot(Snapshot),
@@ -801,58 +866,87 @@ enum ClientMessage {
     EquipHead {
         item_id: String,
     },
+    BuyPixel {
+        color: usize,
+    },
+    PlacePixel {
+        color: usize,
+    },
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Snapshot {
     players: Vec<PlayerSnapshot>,
+    leaderboard: Vec<LeaderboardEntry>,
+    placed_pixels: Vec<PlacedPixel>,
+    economy_rules: EconomyRulesSnapshot,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EconomyRulesSnapshot {
+    lobster_rate_token_unit: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlacedPixel {
+    position: [f64; 3],
+    color: usize,
+}
+
+fn pixel_shortcut(ch: char) -> Option<usize> {
+    match ch {
+        '1' | '&' => Some(0),
+        '2' | 'é' => Some(1),
+        '3' | '"' => Some(2),
+        '4' | '\'' => Some(3),
+        '5' | '(' => Some(4),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LeaderboardEntry {
+    username: String,
+    lobsters: u64,
+    profile_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct PlayerSnapshot {
     id: String,
-    #[serde(default)]
     name: String,
     planet_id: u32,
     lat: f64,
     lon: f64,
     #[serde(default)]
     position: Option<[f64; 3]>,
-    #[serde(default)]
-    basis_up: Option<[f64; 3]>,
     fake: bool,
-    #[serde(default)]
     total_tokens: u64,
-    #[serde(default)]
     lobsters: u64,
-    #[serde(default)]
-    lobster_yield_per_hour: f64,
-    #[serde(default = "default_head")]
     equipped_head: String,
-    #[serde(default)]
     owned_heads: Vec<String>,
-    #[serde(default)]
+    owned_pixels: [u64; PIXEL_COLOR_COUNT],
     jump_height: f64,
+    #[serde(default)]
+    facing: i8,
     walking_phase: u64,
 }
 
-fn default_head() -> String {
-    "default".to_string()
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RewardNotice {
     label: String,
     lobsters: u64,
     streak: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct MarketItem {
     id: String,
     label: String,
     head: String,
     price_lobsters: u64,
+    kind: String,
+    pixel_color: Option<usize>,
 }
 
 impl PlayerSnapshot {
@@ -860,19 +954,6 @@ impl PlayerSnapshot {
         self.position
             .and_then(Vec3::from_array)
             .unwrap_or_else(|| Vec3::from_lat_lon(self.lat, self.lon))
-    }
-
-    fn basis_up_vec(&self) -> Vec3 {
-        let position = self.position_vec();
-        self.basis_up
-            .and_then(Vec3::from_array)
-            .map(|basis_up| {
-                basis_up
-                    .add(position.scale(-basis_up.dot(position)))
-                    .normalize()
-            })
-            .filter(|basis_up| basis_up.length() > 1e-6)
-            .unwrap_or_else(|| position.any_tangent())
     }
 }
 
@@ -882,6 +963,7 @@ struct ClientGameState {
     snapshot: Option<Snapshot>,
     rewards: Vec<RewardNotice>,
     market: Vec<MarketItem>,
+    protocol_error: Option<String>,
 }
 
 impl ClientGameState {
@@ -893,6 +975,29 @@ impl ClientGameState {
             .iter()
             .find(|player| &player.id == self_id)
     }
+}
+
+fn validate_snapshot(snapshot: &Snapshot) -> anyhow::Result<()> {
+    if snapshot.economy_rules.lobster_rate_token_unit == 0 {
+        anyhow::bail!("backend sent invalid economy rule: lobster_rate_token_unit is zero");
+    }
+    for pixel in &snapshot.placed_pixels {
+        if pixel.color >= PIXEL_COLOR_COUNT {
+            anyhow::bail!("backend sent invalid placed pixel color {}", pixel.color);
+        }
+    }
+    for player in &snapshot.players {
+        if player.owned_pixels.len() != PIXEL_COLOR_COUNT {
+            anyhow::bail!(
+                "backend sent invalid pixel inventory for player {}",
+                player.id
+            );
+        }
+        if player.jump_height < 0.0 || !player.jump_height.is_finite() {
+            anyhow::bail!("backend sent invalid jump height for player {}", player.id);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -999,16 +1104,6 @@ impl Vec3 {
         }
     }
 
-    fn any_tangent(self) -> Self {
-        let seed = if self.z.abs() < 0.8 { Self::Z } else { Self::X };
-        let tangent = seed.add(self.scale(-self.dot(seed)));
-        if tangent.length() <= 1e-6 {
-            self.cross(Self::new(0.0, 1.0, 0.0)).normalize()
-        } else {
-            tangent.normalize()
-        }
-    }
-
     fn rotate_around(self, axis: Self, angle: f64) -> Self {
         let axis = axis.normalize();
         self.scale(angle.cos())
@@ -1058,6 +1153,8 @@ struct VisibleGameState {
     token_delta: u64,
     lobsters: u64,
     lobster_yield_per_hour: f64,
+    leaderboard: Vec<LeaderboardEntry>,
+    placed_pixels: Vec<PlacedPixel>,
     players: Vec<VisiblePlayer>,
 }
 
@@ -1072,6 +1169,7 @@ struct VisiblePlayer {
     lobster_yield_per_hour: f64,
     equipped_head: String,
     jump_height: f64,
+    facing: i8,
     walking_phase: u64,
 }
 
@@ -1082,7 +1180,21 @@ impl VisibleGameState {
         width: u16,
         height: u16,
     ) -> Self {
-        let snapshot = state.snapshot.clone().unwrap_or_default();
+        let Some(snapshot) = state.snapshot.clone() else {
+            return Self {
+                width,
+                height,
+                planet_diameter_cells: 90.0,
+                camera_focus: camera.focus,
+                camera_up: camera.up,
+                token_delta: 0,
+                lobsters: 0,
+                lobster_yield_per_hour: 0.0,
+                leaderboard: Vec::new(),
+                placed_pixels: Vec::new(),
+                players: Vec::new(),
+            };
+        };
         let self_position = state
             .self_id
             .as_ref()
@@ -1094,18 +1206,6 @@ impl VisibleGameState {
                     .map(PlayerSnapshot::position_vec)
             })
             .unwrap_or(camera.focus);
-        let self_up = state
-            .self_id
-            .as_ref()
-            .and_then(|self_id| {
-                snapshot
-                    .players
-                    .iter()
-                    .find(|player| &player.id == self_id)
-                    .map(PlayerSnapshot::basis_up_vec)
-            })
-            .unwrap_or(camera.up);
-
         let angle_from_focus = camera.focus.dot(self_position).clamp(-1.0, 1.0).acos();
         let follow_radius = 0.38;
         if angle_from_focus > follow_radius {
@@ -1115,16 +1215,8 @@ impl VisibleGameState {
                 .normalize();
             let rotation_axis = camera.focus.cross(tangent_to_self).normalize();
             camera.focus = camera.focus.rotate_around(rotation_axis, step).normalize();
-            let transported_up = camera.up.rotate_around(rotation_axis, step).normalize();
-            camera.up = transported_up
-                .add(camera.focus.scale(-transported_up.dot(camera.focus)))
-                .normalize();
         }
-        if angle_from_focus <= follow_radius || camera.up.length() <= 1e-6 {
-            camera.up = self_up
-                .add(camera.focus.scale(-self_up.dot(camera.focus)))
-                .normalize();
-        }
+        camera.up = stable_camera_up(camera.focus);
 
         let players: Vec<VisiblePlayer> = snapshot
             .players
@@ -1143,9 +1235,13 @@ impl VisibleGameState {
                     is_fake: player.fake,
                     points: player.total_tokens,
                     lobsters: player.lobsters,
-                    lobster_yield_per_hour: player.lobster_yield_per_hour,
+                    lobster_yield_per_hour: lobster_yield_per_hour(
+                        player.total_tokens,
+                        snapshot.economy_rules.lobster_rate_token_unit,
+                    ),
                     equipped_head,
                     jump_height: player.jump_height,
+                    facing: player.facing,
                     walking_phase: player.walking_phase,
                 }
             })
@@ -1165,14 +1261,27 @@ impl VisibleGameState {
         Self {
             width,
             height,
-            planet_diameter_cells: 101.25,
+            planet_diameter_cells: 90.0,
             camera_focus: camera.focus,
             camera_up: camera.up,
             token_delta: self_economy.2,
             lobsters: self_economy.0,
             lobster_yield_per_hour: self_economy.1,
+            leaderboard: snapshot.leaderboard,
+            placed_pixels: snapshot.placed_pixels,
             players,
         }
+    }
+}
+
+fn stable_camera_up(focus: Vec3) -> Vec3 {
+    let north = Vec3::Z;
+    let up = north.add(focus.scale(-north.dot(focus)));
+    if up.length() > 1e-6 {
+        up.normalize()
+    } else {
+        let east = Vec3::new(0.0, 1.0, 0.0);
+        east.add(focus.scale(-east.dot(focus))).normalize()
     }
 }
 
@@ -1211,8 +1320,9 @@ struct Color(u8, u8, u8);
 const PLANET_OUTLINE: Color = Color(95, 165, 95);
 const PLANET_LAND: Color = Color(80, 145, 80);
 const PLANET_WATER: Color = Color(45, 75, 110);
-const PLAYER_SELF: Color = Color(170, 235, 170);
-const PLAYER_OTHER: Color = Color(255, 190, 125);
+const PLAYER_SELF: Color = Color(80, 180, 255);
+const PLAYER_NPC: Color = Color(255, 190, 125);
+const PLAYER_OTHER: Color = Color(245, 245, 245);
 const HUD: Color = Color(120, 120, 120);
 const STAR_DIM: Color = Color(70, 76, 92);
 const STAR_MID: Color = Color(105, 114, 135);
@@ -1224,6 +1334,13 @@ const ACCENT_1: Color = Color(170, 235, 170);
 const ACCENT_1_DIM: Color = Color(95, 165, 95);
 const ACCENT_2: Color = Color(255, 190, 125);
 const ACCENT_2_DIM: Color = Color(180, 125, 70);
+const PIXEL_COLORS: [Color; PIXEL_COLOR_COUNT] = [
+    Color(255, 80, 80),
+    Color(80, 180, 255),
+    Color(255, 220, 80),
+    Color(120, 235, 120),
+    Color(220, 120, 255),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cell {
@@ -1330,8 +1447,10 @@ impl SmartRenderer {
         &mut self,
         state: &VisibleGameState,
         panel: Option<(&UiPanel, f64)>,
+        selected_pixel_color: usize,
+        pixel_inventory: [u64; PIXEL_COLOR_COUNT],
     ) -> Vec<AnsiAction> {
-        let current = render_app_frame(state, panel);
+        let current = render_app_frame(state, panel, selected_pixel_color, pixel_inventory);
         let actions = diff_frames(self.previous.as_ref(), &current);
         self.previous = Some(current);
         actions
@@ -1365,6 +1484,7 @@ enum UiBlock {
 struct UiRow {
     cells: Vec<String>,
     color: Color,
+    swatch_color: Option<Color>,
 }
 
 impl UiPanel {
@@ -1411,6 +1531,7 @@ impl UiPanel {
                     } else {
                         FG_DIM
                     },
+                    swatch_color: None,
                 })
                 .collect(),
         });
@@ -1450,18 +1571,22 @@ impl UiPanel {
         }
     }
 
-    fn rewards(rewards: &[RewardNotice]) -> Self {
-        let mut lines = vec!["Check-in rewards claimed:".to_string()];
+    fn rewards(rewards: &[RewardNotice], can_close: bool) -> Self {
+        let mut lines = vec!["Check-in rewards:".to_string()];
         for reward in rewards {
-            lines.push(format!(
-                "{}: +{} (streak {})",
-                reward.label,
-                format_lobsters(reward.lobsters),
-                reward.streak
-            ));
+            if reward.lobsters == 0 {
+                lines.push(format!("{} (streak {})", reward.label, reward.streak));
+            } else {
+                lines.push(format!(
+                    "{}: +{} (streak {})",
+                    reward.label,
+                    format_lobsters(reward.lobsters),
+                    reward.streak
+                ));
+            }
         }
         lines.push("Daily: 1000 plus 1000 per streak day.".to_string());
-        lines.push("Weekly: 5000 per streak week.".to_string());
+        lines.push("Weekly: starts on week 2, then 5000 per streak week.".to_string());
 
         Self {
             title: "Rewards".to_string(),
@@ -1469,7 +1594,11 @@ impl UiPanel {
                 lines,
                 color: ACCENT_1,
             }],
-            prompt: Some("Press Enter to close.".to_string()),
+            prompt: Some(if can_close {
+                "Press Enter to close.".to_string()
+            } else {
+                "Rewards will stay visible for a moment.".to_string()
+            }),
         }
     }
 
@@ -1485,16 +1614,23 @@ impl UiPanel {
             .iter()
             .enumerate()
             .map(|(index, item)| {
-                let is_owned = owned.iter().any(|owned| owned == &item.id);
-                let is_equipped = equipped == item.id;
-                let action = if is_equipped {
-                    "equipped"
+                let is_pixel = item.kind == "pixel";
+                let pixel_count = item
+                    .pixel_color
+                    .and_then(|color| self_player.map(|player| player.owned_pixels[color]))
+                    .unwrap_or(0);
+                let is_owned = !is_pixel && owned.iter().any(|owned| owned == &item.id);
+                let is_equipped = !is_pixel && equipped == item.id;
+                let action = if is_pixel {
+                    format!("owned {}", format_count(pixel_count))
+                } else if is_equipped {
+                    "equipped".to_string()
                 } else if is_owned {
-                    "owned"
+                    "owned".to_string()
                 } else if balance >= item.price_lobsters {
-                    "buy"
+                    "buy".to_string()
                 } else {
-                    "locked"
+                    "locked".to_string()
                 };
                 UiRow {
                     cells: vec![
@@ -1502,15 +1638,19 @@ impl UiPanel {
                         item.head.clone(),
                         item.label.clone(),
                         format_lobsters(item.price_lobsters),
-                        action.to_string(),
+                        action,
                     ],
                     color: if index == selected {
                         ACCENT_1
-                    } else if is_owned {
+                    } else if is_owned || is_pixel {
                         FG
                     } else {
                         FG_DIM
                     },
+                    swatch_color: item
+                        .pixel_color
+                        .filter(|_| is_pixel)
+                        .and_then(|color| PIXEL_COLORS.get(color).copied()),
                 }
             })
             .collect();
@@ -1544,6 +1684,11 @@ struct Rect {
 struct AppLayout {
     game: Rect,
     panel: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GameRenderOptions {
+    show_lobster_leaderboard: bool,
 }
 
 fn app_layout(width: u16, height: u16, panel_progress: Option<f64>) -> AppLayout {
@@ -1618,16 +1763,30 @@ fn app_layout(width: u16, height: u16, panel_progress: Option<f64>) -> AppLayout
     }
 }
 
-fn render_app_frame(state: &VisibleGameState, panel: Option<(&UiPanel, f64)>) -> FrameBuffer {
+fn render_app_frame(
+    state: &VisibleGameState,
+    panel: Option<(&UiPanel, f64)>,
+    selected_pixel_color: usize,
+    pixel_inventory: [u64; PIXEL_COLOR_COUNT],
+) -> FrameBuffer {
     let width = state.width.max(1);
     let height = state.height.max(1);
     let layout = app_layout(width, height, panel.map(|(_, progress)| progress));
+    let left_panel_visible = layout.panel.is_some() && layout.game.x > 0;
+    let game_options = GameRenderOptions {
+        show_lobster_leaderboard: width > 200 && !left_panel_visible,
+    };
     let game_state = VisibleGameState {
         width: layout.game.width.max(1),
         height: layout.game.height.max(1),
         ..state.clone()
     };
-    let game = render_game_frame(&game_state);
+    let game = render_game_frame(
+        &game_state,
+        game_options,
+        selected_pixel_color,
+        pixel_inventory,
+    );
     let mut frame = FrameBuffer::new(width, height);
     frame.blit(&game, layout.game.x as i32, layout.game.y as i32);
     if let (Some(rect), Some((panel, _))) = (layout.panel, panel) {
@@ -1712,6 +1871,10 @@ fn draw_block(
                     inner_width,
                     row.color,
                 );
+                if let Some(color) = row.swatch_color {
+                    frame.put(x + 4, *line, '█', color);
+                    frame.put(x + 5, *line, '█', color);
+                }
                 *line += 1;
             }
         }
@@ -1778,12 +1941,24 @@ fn short_method(method: &str) -> &'static str {
     }
 }
 
-fn render_game_frame(state: &VisibleGameState) -> FrameBuffer {
+fn render_game_frame(
+    state: &VisibleGameState,
+    options: GameRenderOptions,
+    selected_pixel_color: usize,
+    pixel_inventory: [u64; PIXEL_COLOR_COUNT],
+) -> FrameBuffer {
     let width = state.width.max(1);
     let height = state.height.max(1);
     let mut frame = FrameBuffer::new(width, height);
     draw_starfield(&mut frame);
-    let cx = width as f64 / 2.0;
+    let leaderboard_visible =
+        options.show_lobster_leaderboard && should_render_lobster_leaderboard(width, height);
+    let leaderboard_width = lobster_leaderboard_width(width);
+    let cx = if leaderboard_visible {
+        width as f64 / 2.0 - leaderboard_width as f64 * 0.28
+    } else {
+        width as f64 / 2.0
+    };
     let cy = height as f64 / 2.0;
     let radius_x = (state.planet_diameter_cells / 2.0).min((width as f64 - 4.0).max(4.0) / 2.0);
     let radius_y = (radius_x / 2.0).min((height as f64 - 6.0).max(3.0) / 2.0);
@@ -1800,6 +1975,7 @@ fn render_game_frame(state: &VisibleGameState) -> FrameBuffer {
             let ny = (y as f64 + 0.5 - cy) / radius_y;
             let d = nx * nx + ny * ny;
             if d < 0.88 {
+                frame.put_cell(x as i32, y as i32, Cell::default());
                 let py = -ny;
                 let depth = (1.0 - nx * nx - py * py).max(0.0).sqrt();
                 let world = right
@@ -1817,6 +1993,23 @@ fn render_game_frame(state: &VisibleGameState) -> FrameBuffer {
                 frame.put(x as i32, y as i32, '.', PLANET_OUTLINE);
             }
         }
+    }
+
+    for pixel in &state.placed_pixels {
+        if pixel.color >= PIXEL_COLOR_COUNT {
+            continue;
+        }
+        let Some(position) = Vec3::from_array(pixel.position) else {
+            continue;
+        };
+        if position.dot(view_normal) <= 0.0 {
+            continue;
+        }
+        let px = position.dot(right);
+        let py = position.dot(up);
+        let sx = (cx + px * radius_x).round() as i32;
+        let sy = (cy - py * radius_y).round() as i32;
+        draw_pixel_block(&mut frame, sx, sy, PIXEL_COLORS[pixel.color]);
     }
 
     let mut players = state.players.clone();
@@ -1844,9 +2037,129 @@ fn render_game_frame(state: &VisibleGameState) -> FrameBuffer {
         format_lobsters_per_hour(state.lobster_yield_per_hour),
         format_lobsters(state.lobsters)
     );
-    let economy_x = width as i32 - economy.chars().count() as i32 - 1;
+    let economy_x = width as i32 - display_width(&economy) as i32 - 1;
     frame.text(economy_x.max(0), 0, &economy, HUD);
+    draw_pixel_inventory(&mut frame, selected_pixel_color, pixel_inventory);
+    if leaderboard_visible {
+        draw_lobster_leaderboard(&mut frame, &state.leaderboard);
+    }
+    draw_footer(&mut frame);
     frame
+}
+
+fn draw_pixel_inventory(
+    frame: &mut FrameBuffer,
+    selected_color: usize,
+    inventory: [u64; PIXEL_COLOR_COUNT],
+) {
+    if frame.height < 3 || !inventory.iter().any(|count| *count > 0) {
+        return;
+    }
+    let y = frame.height as i32 - 2;
+    let mut x = 0;
+    frame.text(x, y, "pixels ", HUD);
+    x += 7;
+    for color in 0..PIXEL_COLOR_COUNT {
+        let count = inventory[color];
+        if count == 0 {
+            continue;
+        }
+        let shortcut = color + 1;
+        let label = if color == selected_color {
+            format!("[{shortcut}:{}]", format_count(count))
+        } else {
+            format!("{shortcut}:{}", format_count(count))
+        };
+        draw_pixel_block(frame, x, y, PIXEL_COLORS[color]);
+        x += 3;
+        frame.text(x, y, &label, HUD);
+        x += label.chars().count() as i32 + 1;
+    }
+    frame.text(x, y, "P place", HUD);
+}
+
+fn draw_pixel_block(frame: &mut FrameBuffer, x: i32, y: i32, color: Color) {
+    frame.put(x, y, '█', color);
+    frame.put(x + 1, y, '█', color);
+}
+
+fn draw_footer(frame: &mut FrameBuffer) {
+    if frame.height == 0 {
+        return;
+    }
+    let width = frame.width as usize;
+    let text_width = display_width(FOOTER_TEXT);
+    let x = if text_width >= width {
+        0
+    } else {
+        ((width - text_width) / 2) as i32
+    };
+    draw_clipped_text(
+        frame,
+        x,
+        frame.height as i32 - 1,
+        FOOTER_TEXT,
+        width.saturating_sub(x.max(0) as usize),
+        HUD,
+    );
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| match ch {
+            '🦞' | '🙂' | '🤠' | '😎' | '🐸' | '☀' | '📦' => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardEntry]) {
+    if !should_render_lobster_leaderboard(frame.width, frame.height) {
+        return;
+    }
+
+    let leaders = lobster_leaders(leaderboard);
+    if leaders.is_empty() {
+        return;
+    }
+
+    let panel_width = lobster_leaderboard_width(frame.width);
+    let x = frame.width as i32 - panel_width as i32 - 1;
+    let max_entries = ((frame.height as usize).saturating_sub(4)).min(10);
+    draw_clipped_text(frame, x, 2, "lobster leaders", panel_width, ACCENT_2);
+
+    for (index, player) in leaders.into_iter().take(max_entries).enumerate() {
+        let line = format!(
+            "{:>2}. @{:<12} {:>8} {}",
+            index + 1,
+            player.username,
+            format_lobsters(player.lobsters),
+            player.profile_url
+        );
+        draw_clipped_text(frame, x, 3 + index as i32, &line, panel_width, HUD);
+    }
+}
+
+fn should_render_lobster_leaderboard(width: u16, height: u16) -> bool {
+    width > 200 && height >= 7
+}
+
+fn lobster_leaderboard_width(width: u16) -> usize {
+    (width as usize - 2).min(58)
+}
+
+fn lobster_leaders(leaderboard: &[LeaderboardEntry]) -> Vec<&LeaderboardEntry> {
+    let mut leaders = leaderboard
+        .iter()
+        .filter(|entry| !entry.username.trim().is_empty())
+        .collect::<Vec<_>>();
+    leaders.sort_by(|a, b| {
+        b.lobsters
+            .cmp(&a.lobsters)
+            .then_with(|| a.username.to_lowercase().cmp(&b.username.to_lowercase()))
+    });
+    leaders.truncate(10);
+    leaders
 }
 
 fn draw_starfield(frame: &mut FrameBuffer) {
@@ -1999,16 +2312,22 @@ fn format_lobsters(lobsters: u64) -> String {
     format!("🦞{}", format_count(lobsters))
 }
 
+fn lobster_yield_per_hour(total_tokens: u64, rate_token_unit: u64) -> f64 {
+    assert!(
+        rate_token_unit > 0,
+        "economy rate token unit must be nonzero"
+    );
+    total_tokens as f64 / rate_token_unit as f64 * 60.0
+}
+
 fn format_lobsters_per_hour(lobsters_per_hour: f64) -> String {
     format!("🦞{}", format_rate(lobsters_per_hour))
 }
 
 fn format_rate(value: f64) -> String {
-    let value = if value.is_finite() {
-        value.max(0.0)
-    } else {
-        0.0
-    };
+    if !value.is_finite() || value < 0.0 {
+        return "invalid".to_string();
+    }
     if value == 0.0 {
         return "0".to_string();
     }
@@ -2052,15 +2371,25 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
     let color = if player.is_self {
         PLAYER_SELF
     } else if player.is_fake {
-        PLAYER_OTHER
+        PLAYER_NPC
     } else {
-        Color(245, 245, 245)
+        PLAYER_OTHER
     };
-    let legs = match player.walking_phase % 4 {
-        0 => "|\\",
-        1 => "\\|",
-        2 => "/|",
-        _ => "||",
+    let facing_right = player.facing > 0;
+    let legs = if facing_right {
+        match player.walking_phase % 4 {
+            0 => "/|",
+            1 => "|/",
+            2 => "|\\",
+            _ => "||",
+        }
+    } else {
+        match player.walking_phase % 4 {
+            0 => "|\\",
+            1 => "\\|",
+            2 => "/|",
+            _ => "||",
+        }
     };
     let lift = player.jump_height.ceil().clamp(0.0, 2.0) as i32;
     if lift > 0 {
@@ -2083,10 +2412,12 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
         format!("{head} ")
     };
     let head_x = if head.is_ascii() { x - 1 } else { x };
+    let chest = if facing_right { "-]-" } else { "-[-" };
+    let legs_x = if facing_right { x - 2 } else { x - 1 };
     let rows = [
         (0, head_x, head_row),
-        (1, x - 1, "-|-".to_string()),
-        (2, x - 1, format!(" {legs}")),
+        (1, x - 1, chest.to_string()),
+        (2, legs_x, format!(" {legs}")),
     ];
     for (dy, row_x, text) in rows {
         frame.text(row_x, body_y - 2 + dy, &text, color);
@@ -2094,10 +2425,11 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
     if !player.name.is_empty() {
         let label = format!("@{}", player.name);
         let label_x = x - (label.chars().count() as i32 / 2);
-        if player.is_self {
+        if !player.is_fake {
             let points = format_token_points(player.points);
             let points_x = x - (points.chars().count() as i32 / 2);
-            frame.text(points_x, body_y - 4, &points, ACCENT_1);
+            let points_color = if player.is_self { ACCENT_1 } else { FG_DIM };
+            frame.text(points_x, body_y - 4, &points, points_color);
         }
         frame.text(label_x, body_y - 3, &label, HUD);
     }
@@ -2770,6 +3102,15 @@ mod tests {
         assert_eq!(format_lobsters_per_hour(0.06), "🦞0.06");
         assert_eq!(format_lobsters_per_hour(0.0014), "🦞0.001");
         assert_eq!(format_lobsters_per_hour(7.5), "🦞7.5");
+        assert_eq!(format_lobsters_per_hour(f64::NAN), "🦞invalid");
+        assert_eq!(
+            format_lobsters_per_hour(lobster_yield_per_hour(1_800_000, 100_000_000,)),
+            "🦞1.08"
+        );
+        assert_eq!(
+            format_lobsters_per_hour(lobster_yield_per_hour(100_000_000, 100_000_000,)),
+            "🦞60"
+        );
         assert_eq!(builtin_head("default"), "0");
         assert_eq!(builtin_head("box"), "📦");
         assert_eq!(equipped_head_glyph("default"), "0");

@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="${GAME_CLI_REPO:-REPLACE_WITH_GITHUB_REPO}"
-INSTALL_DIR="${GAME_INSTALL_DIR:-$HOME/.ascii/bin}"
+REPO="${GAME_CLI_REPO:-ariana-dot-dev/ascii-world}"
+INSTALL_DIR="${GAME_INSTALL_DIR:-}"
 
 case "$(uname -s)" in
   Linux) OS="linux" ;;
@@ -16,14 +16,27 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-ASSET="game-${OS}-${ARCH}"
+ASSET="world-${OS}-${ARCH}"
 URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+
+if [ -z "$INSTALL_DIR" ]; then
+  if [ -w /usr/local/bin ]; then
+    INSTALL_DIR="/usr/local/bin"
+  else
+    INSTALL_DIR="$HOME/.local/bin"
+  fi
+fi
 
 mkdir -p "$INSTALL_DIR"
 TMP="$(mktemp)"
 curl -fsSL "$URL" -o "$TMP"
 chmod +x "$TMP"
-mv "$TMP" "$INSTALL_DIR/game"
+mv "$TMP" "$INSTALL_DIR/world"
 
-echo "Installed game to $INSTALL_DIR/game"
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *) echo "Add $INSTALL_DIR to PATH to run world from any terminal." ;;
+esac
 
+echo "Installed world to $INSTALL_DIR/world"
+echo "Run: world"

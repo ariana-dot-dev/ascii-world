@@ -105,6 +105,7 @@ struct Game {
 
 struct GameWorld {
     players: HashMap<String, Player>,
+    placed_pixels: HashMap<String, PlacedPixel>,
     next_npc_id: u64,
     last_tick: Instant,
 }
@@ -113,6 +114,7 @@ struct GameWorld {
 struct Player {
     id: String,
     user_id: Option<Uuid>,
+    last_seen: Instant,
     name: String,
     planet_id: u32,
     position: Vec3,
@@ -127,6 +129,8 @@ struct Player {
     last_economy_at: Instant,
     equipped_head: String,
     owned_heads: Vec<String>,
+    owned_pixels: [u64; PIXEL_COLOR_COUNT],
+    facing: i8,
     walking_phase: u64,
     npc_movement: Option<NpcMovement>,
 }
@@ -137,6 +141,7 @@ struct UserEconomy {
     lobster_micros: u64,
     equipped_head: String,
     owned_heads: Vec<String>,
+    owned_pixels: [u64; PIXEL_COLOR_COUNT],
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +151,7 @@ struct EconomySave {
     lobster_micros: u64,
     equipped_head: String,
     owned_heads: Vec<String>,
+    owned_pixels: [u64; PIXEL_COLOR_COUNT],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +167,14 @@ struct MarketItemSnapshot {
     label: String,
     head: String,
     price_lobsters: u64,
+    kind: String,
+    pixel_color: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlacedPixel {
+    position: [f64; 3],
+    color: usize,
 }
 
 #[derive(Clone)]
@@ -219,6 +233,12 @@ enum ClientMessage {
     EquipHead {
         item_id: String,
     },
+    BuyPixel {
+        color: usize,
+    },
+    PlacePixel {
+        color: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -236,6 +256,21 @@ enum ServerMessage {
 struct Snapshot {
     server_time_ms: u64,
     players: Vec<PlayerSnapshot>,
+    leaderboard: Vec<LeaderboardEntry>,
+    placed_pixels: Vec<PlacedPixel>,
+    economy_rules: EconomyRulesSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EconomyRulesSnapshot {
+    lobster_rate_token_unit: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LeaderboardEntry {
+    username: String,
+    lobsters: u64,
+    profile_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,10 +285,11 @@ struct PlayerSnapshot {
     fake: bool,
     total_tokens: u64,
     lobsters: u64,
-    lobster_yield_per_hour: f64,
     equipped_head: String,
     owned_heads: Vec<String>,
+    owned_pixels: [u64; PIXEL_COLOR_COUNT],
     jump_height: f64,
+    facing: i8,
     walking_phase: u64,
 }
 
@@ -408,10 +444,11 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to record server boot")?;
 
     let game = Game::new();
-    tokio::spawn(run_game_loop(game.clone()));
+    tokio::spawn(run_game_loop(game.clone(), db.clone()));
 
     let state = AppState { db, boot_id, game };
     let app = Router::new()
+        .route("/", get(landing_page))
         .route("/health", get(health))
         .route("/ws", get(ws))
         .route("/spectate", get(spectate))
@@ -421,6 +458,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/terms", get(terms_page))
         .route("/privacy", get(privacy_page))
         .route("/install.sh", get(install_sh))
+        .route("/install.ps1", get(install_ps1))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -730,13 +768,14 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
             i32,
             String,
             Value,
+            Value,
         ),
     >(
         r#"
         SELECT id, x_username, x_name, total_tokens, lobster_micros, last_lobster_at,
                last_daily_reward_date, daily_streak_days,
                last_weekly_reward_monday, weekly_streak_weeks,
-               equipped_head, owned_heads
+               equipped_head, owned_heads, owned_pixels
         FROM game_users
         WHERE api_token = $1
         LIMIT 1
@@ -759,6 +798,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
         weekly_streak_weeks,
         equipped_head,
         owned_heads,
+        owned_pixels,
     )) = row
     else {
         return Ok(None);
@@ -798,13 +838,21 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
         } else {
             1
         };
-        let lobsters = 5_000_u64.saturating_mul(weekly_streak_weeks.max(1) as u64);
-        lobster_micros = lobster_micros.saturating_add(lobsters.saturating_mul(LOBSTER_MICROS));
-        rewards.push(RewardNotice {
-            label: "Weekly streak".to_string(),
-            lobsters,
-            streak: weekly_streak_weeks,
-        });
+        if weekly_streak_weeks >= 2 {
+            let lobsters = 5_000_u64.saturating_mul(weekly_streak_weeks as u64);
+            lobster_micros = lobster_micros.saturating_add(lobsters.saturating_mul(LOBSTER_MICROS));
+            rewards.push(RewardNotice {
+                label: "Weekly streak".to_string(),
+                lobsters,
+                streak: weekly_streak_weeks,
+            });
+        } else {
+            rewards.push(RewardNotice {
+                label: "Weekly starts next week".to_string(),
+                lobsters: 0,
+                streak: weekly_streak_weeks,
+            });
+        }
     }
 
     let mut owned_heads = owned_heads
@@ -829,6 +877,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
     } else {
         "default".to_string()
     };
+    let owned_pixels = parse_pixel_inventory(&owned_pixels)?;
 
     sqlx::query(
         r#"
@@ -842,6 +891,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
             weekly_streak_weeks = $7,
             equipped_head = $8,
             owned_heads = $9,
+            owned_pixels = $10,
             updated_at = now()
         WHERE id = $1
         "#,
@@ -860,6 +910,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
             .map(|item| Value::String(item.clone()))
             .collect(),
     ))
+    .bind(pixel_inventory_json(owned_pixels))
     .execute(db)
     .await?;
 
@@ -871,9 +922,170 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
             lobster_micros,
             equipped_head,
             owned_heads,
+            owned_pixels,
         },
         rewards,
     }))
+}
+
+fn parse_pixel_inventory(value: &Value) -> anyhow::Result<[u64; PIXEL_COLOR_COUNT]> {
+    let mut inventory = [0; PIXEL_COLOR_COUNT];
+    let items = value
+        .as_array()
+        .context("owned_pixels must be a JSON array")?;
+    if items.len() != PIXEL_COLOR_COUNT {
+        anyhow::bail!(
+            "owned_pixels must have {PIXEL_COLOR_COUNT} entries, got {}",
+            items.len()
+        );
+    }
+    for (index, item) in items.iter().enumerate() {
+        inventory[index] = item
+            .as_u64()
+            .with_context(|| format!("owned_pixels[{index}] must be a non-negative integer"))?;
+    }
+    Ok(inventory)
+}
+
+fn pixel_inventory_json(inventory: [u64; PIXEL_COLOR_COUNT]) -> Value {
+    Value::Array(inventory.into_iter().map(Value::from).collect())
+}
+
+async fn landing_page() -> Response {
+    let page = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ascii World</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: #090909; color: #d7d0bf; }
+body {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 24px 24px 72px;
+  font-family: "Lilex Mono", "Lilex Nerd Font Mono", "Lilex", ui-monospace, monospace;
+  font-size: clamp(13px, 1.7vw, 18px);
+  font-style: italic;
+  font-weight: 400;
+  line-height: 1.45;
+}
+.screen {
+  width: min(96vw, 96ch);
+  min-height: min(86vh, 30rem);
+  display: grid;
+  place-items: center;
+  padding: 2ch;
+}
+.term {
+  width: min(100%, 72ch);
+  color: #d7d0bf;
+  text-align: center;
+  line-height: inherit;
+}
+.title { color: #d7d0bf; font: inherit; font-weight: 400; letter-spacing: 0; }
+.dim { color: #827d72; }
+.cmd {
+  display: block;
+  width: 100%;
+  margin: .3rem auto 1rem;
+  padding: 0;
+  color: #d7d0bf;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.toggle {
+  display: inline-grid;
+  grid-auto-flow: column;
+  gap: 2ch;
+  margin: 1rem 0 .4rem;
+}
+button {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: #827d72;
+  font: inherit;
+  font-style: normal;
+  cursor: pointer;
+  padding: 0;
+}
+button::before { content: " "; }
+button::after { content: " "; }
+button[aria-pressed="true"] { color: #d7d0bf; }
+button[aria-pressed="true"]::before { content: "["; }
+button[aria-pressed="true"]::after { content: "]"; }
+button:focus-visible { outline: 1px solid #d7d0bf; outline-offset: 2px; }
+.footer {
+  position: fixed;
+  left: 2ch;
+  right: 2ch;
+  bottom: 2ch;
+  color: #827d72;
+  text-align: center;
+}
+.footer a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: .18em;
+}
+</style>
+</head>
+<body>
+<main class="screen">
+<section class="term" aria-label="Ascii World landing page">
+<div class="title">Ascii World</div>
+<div class="dim">The idle multiplayer game for vibe coders</div>
+<div class="toggle" role="group" aria-label="platform">
+<button type="button" data-platform="mac" aria-pressed="false" aria-label="macOS">🍎</button>
+<button type="button" data-platform="linux" aria-pressed="true" aria-label="Linux">🐧</button>
+<button type="button" data-platform="windows" aria-pressed="false" aria-label="Windows">🪟</button>
+</div>
+<code id="install" class="cmd"></code>
+<div class="dim">once installed, run:</div>
+<code id="run" class="cmd"></code>
+</section>
+</main>
+<footer class="footer">Made and hosted by agents on <a href="https://box.ascii.dev">box.ascii.dev</a>, the cheapest and most powerful AI sandboxes</footer>
+<script>
+const origin = window.location.origin;
+const commands = {
+  mac: {
+    install: `curl -fsSL ${origin}/install.sh | sh`,
+    run: `world`
+  },
+  linux: {
+    install: `curl -fsSL ${origin}/install.sh | sh`,
+    run: `world`
+  },
+  windows: {
+    install: `powershell -ExecutionPolicy Bypass -c "irm ${origin}/install.ps1 | iex"`,
+    run: `world`
+  }
+};
+const install = document.getElementById("install");
+const run = document.getElementById("run");
+function pick(platform) {
+  for (const button of document.querySelectorAll("button[data-platform]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.platform === platform));
+  }
+  install.textContent = commands[platform].install;
+  run.textContent = commands[platform].run;
+}
+for (const button of document.querySelectorAll("button[data-platform]")) {
+  button.addEventListener("click", () => pick(button.dataset.platform));
+}
+pick(navigator.platform.toLowerCase().includes("win") ? "windows" : navigator.platform.toLowerCase().includes("mac") ? "mac" : "linux");
+</script>
+</body>
+</html>"#;
+    ([("content-type", "text/html; charset=utf-8")], page).into_response()
 }
 
 async fn terms_page() -> Response {
@@ -997,10 +1209,25 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
                                     }
                                 }
                             }
+                            Ok(ClientMessage::BuyPixel { color }) => {
+                                if let Some(save) = state.game.buy_pixel(&player_id, color).await {
+                                    if let Err(err) = persist_economy(&state.db, save).await {
+                                        error!("failed to persist pixel purchase: {err}");
+                                    }
+                                }
+                            }
+                            Ok(ClientMessage::PlacePixel { color }) => {
+                                if let Some(save) = state.game.place_pixel(&player_id, color).await {
+                                    if let Err(err) = persist_economy(&state.db, save).await {
+                                        error!("failed to persist pixel placement: {err}");
+                                    }
+                                }
+                            }
                             Err(err) => error!("bad client message: {err}"),
                         }
                     }
                     Some(Ok(Message::Ping(bytes))) => {
+                        state.game.touch_player(&player_id).await;
                         if sender.send(Message::Pong(bytes)).await.is_err() {
                             break;
                         }
@@ -1018,6 +1245,15 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
                     break;
                 };
                 if send_json(&mut sender, &ServerMessage::Snapshot(snapshot)).await.is_err() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(20)) => {
+                if state
+                    .game
+                    .is_player_stale(&player_id, Duration::from_secs(20))
+                    .await
+                {
                     break;
                 }
             }
@@ -1082,6 +1318,7 @@ async fn persist_economy(db: &PgPool, save: EconomySave) -> anyhow::Result<()> {
             last_lobster_at = now(),
             equipped_head = $4,
             owned_heads = $5,
+            owned_pixels = $6,
             updated_at = now()
         WHERE id = $1
         "#,
@@ -1096,6 +1333,7 @@ async fn persist_economy(db: &PgPool, save: EconomySave) -> anyhow::Result<()> {
             .map(Value::String)
             .collect::<Vec<_>>(),
     ))
+    .bind(pixel_inventory_json(save.owned_pixels))
     .execute(db)
     .await?;
     Ok(())
@@ -1107,6 +1345,7 @@ impl Game {
         let players = HashMap::new();
         let mut world = GameWorld {
             players,
+            placed_pixels: HashMap::new(),
             next_npc_id: 0,
             last_tick: Instant::now(),
         };
@@ -1129,6 +1368,7 @@ impl Game {
             Player {
                 id,
                 user_id: Some(user.id),
+                last_seen: Instant::now(),
                 name: user.username,
                 planet_id: 0,
                 position,
@@ -1143,6 +1383,8 @@ impl Game {
                 last_economy_at: Instant::now(),
                 equipped_head: user.economy.equipped_head,
                 owned_heads: user.economy.owned_heads,
+                owned_pixels: user.economy.owned_pixels,
+                facing: 0,
                 walking_phase: 0,
                 npc_movement: None,
             },
@@ -1162,13 +1404,33 @@ impl Game {
                 lobster_micros: player.lobster_micros,
                 equipped_head: player.equipped_head,
                 owned_heads: player.owned_heads,
+                owned_pixels: player.owned_pixels,
             })
         })
+    }
+
+    async fn touch_player(&self, id: &str) {
+        let mut world = self.world.lock().await;
+        if let Some(player) = world.players.get_mut(id) {
+            player.last_seen = Instant::now();
+        }
+    }
+
+    async fn is_player_stale(&self, id: &str, max_idle: Duration) -> bool {
+        let world = self.world.lock().await;
+        world
+            .players
+            .get(id)
+            .map(|player| {
+                !player.fake && player.last_seen.elapsed().checked_sub(max_idle).is_some()
+            })
+            .unwrap_or(false)
     }
 
     async fn set_input(&self, id: &str, input: InputState) {
         let mut world = self.world.lock().await;
         if let Some(player) = world.players.get_mut(id) {
+            player.last_seen = Instant::now();
             let jump_started = input.jump && !player.input.jump;
             player.input = input;
             if jump_started && player.jump_height <= JUMP_GROUND_EPSILON {
@@ -1180,6 +1442,7 @@ impl Game {
     async fn set_total_tokens(&self, id: &str, total_tokens: u64) -> Option<EconomySave> {
         let mut world = self.world.lock().await;
         let player = world.players.get_mut(id)?;
+        player.last_seen = Instant::now();
         accrue_lobsters(player, Instant::now());
         player.total_tokens = player.total_tokens.max(total_tokens);
         player.user_id.map(|user_id| EconomySave {
@@ -1188,13 +1451,18 @@ impl Game {
             lobster_micros: player.lobster_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
+            owned_pixels: player.owned_pixels,
         })
     }
 
     async fn buy_head(&self, id: &str, item_id: &str) -> Option<EconomySave> {
         let item = market_item(item_id)?;
+        if item.kind != "head" {
+            return None;
+        }
         let mut world = self.world.lock().await;
         let player = world.players.get_mut(id)?;
+        player.last_seen = Instant::now();
         accrue_lobsters(player, Instant::now());
         if player.owned_heads.iter().any(|owned| owned == item_id) {
             player.equipped_head = item.id;
@@ -1213,13 +1481,17 @@ impl Game {
             lobster_micros: player.lobster_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
+            owned_pixels: player.owned_pixels,
         })
     }
 
     async fn equip_head(&self, id: &str, item_id: &str) -> Option<EconomySave> {
-        market_item(item_id)?;
+        if market_item(item_id)?.kind != "head" {
+            return None;
+        }
         let mut world = self.world.lock().await;
         let player = world.players.get_mut(id)?;
+        player.last_seen = Instant::now();
         accrue_lobsters(player, Instant::now());
         if !player.owned_heads.iter().any(|owned| owned == item_id) {
             return None;
@@ -1231,33 +1503,127 @@ impl Game {
             lobster_micros: player.lobster_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
+            owned_pixels: player.owned_pixels,
         })
+    }
+
+    async fn buy_pixel(&self, id: &str, color: usize) -> Option<EconomySave> {
+        if color >= PIXEL_COLOR_COUNT {
+            return None;
+        }
+        let mut world = self.world.lock().await;
+        let player = world.players.get_mut(id)?;
+        player.last_seen = Instant::now();
+        accrue_lobsters(player, Instant::now());
+        let price_micros = PIXEL_PACK_PRICE_LOBSTERS.saturating_mul(LOBSTER_MICROS);
+        if player.lobster_micros < price_micros {
+            return None;
+        }
+        player.lobster_micros = player.lobster_micros.saturating_sub(price_micros);
+        player.owned_pixels[color] = player.owned_pixels[color].saturating_add(PIXEL_PACK_SIZE);
+        player.user_id.map(|user_id| EconomySave {
+            user_id,
+            total_tokens: player.total_tokens,
+            lobster_micros: player.lobster_micros,
+            equipped_head: player.equipped_head.clone(),
+            owned_heads: player.owned_heads.clone(),
+            owned_pixels: player.owned_pixels,
+        })
+    }
+
+    async fn place_pixel(&self, id: &str, color: usize) -> Option<EconomySave> {
+        if color >= PIXEL_COLOR_COUNT {
+            return None;
+        }
+        let mut world = self.world.lock().await;
+        let player = world.players.get_mut(id)?;
+        player.last_seen = Instant::now();
+        if player.owned_pixels[color] == 0 {
+            return None;
+        }
+        player.owned_pixels[color] -= 1;
+        let position = player.position.normalize();
+        let save = player.user_id.map(|user_id| EconomySave {
+            user_id,
+            total_tokens: player.total_tokens,
+            lobster_micros: player.lobster_micros,
+            equipped_head: player.equipped_head.clone(),
+            owned_heads: player.owned_heads.clone(),
+            owned_pixels: player.owned_pixels,
+        });
+        world.placed_pixels.insert(
+            placed_pixel_key(position),
+            PlacedPixel {
+                position: position.to_array(),
+                color,
+            },
+        );
+        save
     }
 }
 
-async fn run_game_loop(game: GameHandle) {
+async fn run_game_loop(game: GameHandle, db: PgPool) {
     let mut ticker = tokio::time::interval(Duration::from_millis(50));
+    let mut leaderboard = Vec::new();
+    let mut next_leaderboard_refresh = Instant::now();
     loop {
         ticker.tick().await;
+        let now = Instant::now();
+        if now >= next_leaderboard_refresh {
+            match fetch_lobster_leaderboard(&db).await {
+                Ok(next_leaderboard) => leaderboard = next_leaderboard,
+                Err(err) => error!("failed to refresh lobster leaderboard: {err}"),
+            }
+            next_leaderboard_refresh = now + Duration::from_secs(5);
+        }
         let snapshot = {
             let mut world = game.world.lock().await;
-            let now = Instant::now();
             let dt = now.duration_since(world.last_tick).as_secs_f64().min(0.2);
             world.last_tick = now;
             tick_world(&mut world, dt);
-            snapshot_world(&world)
+            snapshot_world(&world, leaderboard.clone())
         };
         let _ = game.snapshots.send(snapshot);
     }
+}
+
+async fn fetch_lobster_leaderboard(db: &PgPool) -> anyhow::Result<Vec<LeaderboardEntry>> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT x_username, lobster_micros
+        FROM game_users
+        WHERE x_username <> ''
+        ORDER BY lobster_micros DESC, lower(x_username) ASC
+        LIMIT 10
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(username, lobster_micros)| {
+            let username = username.trim().trim_start_matches('@').to_string();
+            LeaderboardEntry {
+                profile_url: format!("https://x.com/{username}"),
+                username,
+                lobsters: lobster_balance(lobster_micros.max(0) as u64),
+            }
+        })
+        .filter(|entry| !entry.username.is_empty())
+        .collect())
 }
 
 const MIN_ENTITY_COUNT: usize = 30;
 const ANGULAR_SPEED_RADIANS_PER_SECOND: f64 = 0.275;
 const NPC_CURVE_AMPLITUDE_RADIANS: f64 = 0.18;
 const NPC_PATH_SAMPLES: usize = 32;
+const PIXEL_COLOR_COUNT: usize = 5;
+const PIXEL_PACK_SIZE: u64 = 1;
+const PIXEL_PACK_PRICE_LOBSTERS: u64 = 1_000;
 const LOBSTER_MICROS: u64 = 1_000_000;
-const LOBSTER_RATE_TOKEN_UNIT: u64 = 1_000_000_000;
-const LOBSTER_ACCRUAL_TOKEN_MS_PER_MICRO: u64 = 60_000_000;
+const LOBSTER_RATE_TOKEN_UNIT: u64 = 100_000_000;
+const LOBSTER_ACCRUAL_TOKEN_MS_PER_MICRO: u64 = 6_000_000;
 const JUMP_IMPULSE_CELLS_PER_SECOND: f64 = 7.6;
 const JUMP_GRAVITY_CELLS_PER_SECOND2: f64 = 19.0;
 const MAX_JUMP_HEIGHT_CELLS: f64 = 2.0;
@@ -1287,23 +1653,32 @@ const MARKET_ITEMS: &[(&str, &str, &str, u64)] = &[
 ];
 
 fn market_items() -> Vec<MarketItemSnapshot> {
-    MARKET_ITEMS
+    let mut items = MARKET_ITEMS
         .iter()
         .map(|(id, label, head, price_lobsters)| MarketItemSnapshot {
             id: (*id).to_string(),
             label: (*label).to_string(),
             head: (*head).to_string(),
             price_lobsters: *price_lobsters,
+            kind: "head".to_string(),
+            pixel_color: None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for color in 0..PIXEL_COLOR_COUNT {
+        items.push(MarketItemSnapshot {
+            id: format!("pixel-{color}"),
+            label: format!("Pixel pack {}", color + 1),
+            head: "█".to_string(),
+            price_lobsters: PIXEL_PACK_PRICE_LOBSTERS,
+            kind: "pixel".to_string(),
+            pixel_color: Some(color),
+        });
+    }
+    items
 }
 
 fn market_item(id: &str) -> Option<MarketItemSnapshot> {
     market_items().into_iter().find(|item| item.id == id)
-}
-
-fn lobster_yield_per_hour(total_tokens: u64) -> f64 {
-    total_tokens as f64 / LOBSTER_RATE_TOKEN_UNIT as f64 * 60.0
 }
 
 fn accrue_lobsters(player: &mut Player, now: Instant) {
@@ -1325,6 +1700,13 @@ fn lobster_balance(lobster_micros: u64) -> u64 {
     lobster_micros / LOBSTER_MICROS
 }
 
+fn placed_pixel_key(position: Vec3) -> String {
+    let (lat, lon) = position.lat_lon();
+    let lat_bucket = ((lat + FRAC_PI_2) * 96.0 / PI).floor() as i32;
+    let lon_bucket = ((wrap_pi(lon) + PI) * 192.0 / TAU).floor() as i32;
+    format!("{lat_bucket}:{lon_bucket}")
+}
+
 fn ensure_minimum_entities(world: &mut GameWorld) {
     let mut rng = rand::rng();
     while world.players.len() < MIN_ENTITY_COUNT {
@@ -1343,6 +1725,7 @@ fn spawn_npc(world: &mut GameWorld, rng: &mut impl Rng) {
         Player {
             id,
             user_id: None,
+            last_seen: Instant::now(),
             name: name.to_string(),
             planet_id: 0,
             position,
@@ -1357,6 +1740,8 @@ fn spawn_npc(world: &mut GameWorld, rng: &mut impl Rng) {
             last_economy_at: Instant::now(),
             equipped_head: "default".to_string(),
             owned_heads: vec!["default".to_string()],
+            owned_pixels: [0; PIXEL_COLOR_COUNT],
+            facing: 0,
             walking_phase: 0,
             npc_movement: Some(NpcMovement::Idle {
                 remaining_seconds: random_npc_idle_seconds(rng),
@@ -1416,9 +1801,15 @@ fn tick_world(world: &mut GameWorld, dt: f64) {
         }
         if player.input.right {
             direction = direction.add(screen_right);
+            if !player.input.left {
+                player.facing = 1;
+            }
         }
         if player.input.left {
             direction = direction.add(screen_right.scale(-1.0));
+            if !player.input.right {
+                player.facing = -1;
+            }
         }
         direction = direction.add(player.position.scale(-direction.dot(player.position)));
         if direction.length() > 1e-6 {
@@ -1594,7 +1985,7 @@ fn move_player_to_position(player: &mut Player, next_position: Vec3) {
         .normalize();
 }
 
-fn snapshot_world(world: &GameWorld) -> Snapshot {
+fn snapshot_world(world: &GameWorld, leaderboard: Vec<LeaderboardEntry>) -> Snapshot {
     let players = world
         .players
         .values()
@@ -1611,17 +2002,24 @@ fn snapshot_world(world: &GameWorld) -> Snapshot {
                 fake: player.fake,
                 total_tokens: player.total_tokens,
                 lobsters: lobster_balance(player.lobster_micros),
-                lobster_yield_per_hour: lobster_yield_per_hour(player.total_tokens),
                 equipped_head: player.equipped_head.clone(),
                 owned_heads: player.owned_heads.clone(),
+                owned_pixels: player.owned_pixels,
                 jump_height: player.jump_height,
+                facing: player.facing,
                 walking_phase: player.walking_phase,
             }
         })
         .collect();
+    let placed_pixels = world.placed_pixels.values().cloned().collect();
     Snapshot {
         server_time_ms: 0,
         players,
+        leaderboard,
+        placed_pixels,
+        economy_rules: EconomyRulesSnapshot {
+            lobster_rate_token_unit: LOBSTER_RATE_TOKEN_UNIT,
+        },
     }
 }
 
@@ -1633,8 +2031,8 @@ async fn install_sh() -> Response {
     let script = r#"#!/usr/bin/env sh
 set -eu
 
-REPO="${GAME_CLI_REPO:-REPLACE_WITH_GITHUB_REPO}"
-INSTALL_DIR="${GAME_INSTALL_DIR:-$HOME/.ascii/bin}"
+REPO="${GAME_CLI_REPO:-ariana-dot-dev/ascii-world}"
+INSTALL_DIR="${GAME_INSTALL_DIR:-}"
 
 case "$(uname -s)" in
   Linux) OS="linux" ;;
@@ -1648,19 +2046,52 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-ASSET="game-${OS}-${ARCH}"
+ASSET="world-${OS}-${ARCH}"
 URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+
+if [ -z "$INSTALL_DIR" ]; then
+  if [ -w /usr/local/bin ]; then
+    INSTALL_DIR="/usr/local/bin"
+  else
+    INSTALL_DIR="$HOME/.local/bin"
+  fi
+fi
 
 mkdir -p "$INSTALL_DIR"
 TMP="$(mktemp)"
 curl -fsSL "$URL" -o "$TMP"
 chmod +x "$TMP"
-mv "$TMP" "$INSTALL_DIR/game"
+mv "$TMP" "$INSTALL_DIR/world"
 
-echo "Installed game to $INSTALL_DIR/game"
-echo "Run: $INSTALL_DIR/game"
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *) echo "Add $INSTALL_DIR to PATH to run world from any terminal." ;;
+esac
+
+echo "Installed world to $INSTALL_DIR/world"
+echo "Run: world"
 "#;
     ([("content-type", "text/x-shellscript")], script).into_response()
+}
+
+async fn install_ps1() -> Response {
+    let script = r#"$ErrorActionPreference = "Stop"
+
+$repo = if ($env:GAME_CLI_REPO) { $env:GAME_CLI_REPO } else { "ariana-dot-dev/ascii-world" }
+$installDir = if ($env:GAME_INSTALL_DIR) { $env:GAME_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps" }
+$asset = "world-windows-x64.exe"
+$url = "https://github.com/$repo/releases/latest/download/$asset"
+$target = Join-Path $installDir "world.exe"
+$tmp = New-TemporaryFile
+
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Invoke-WebRequest -Uri $url -OutFile $tmp
+Move-Item -Force -Path $tmp -Destination $target
+
+Write-Host "Installed world to $target"
+Write-Host "Run: world"
+"#;
+    ([("content-type", "text/plain; charset=utf-8")], script).into_response()
 }
 
 struct AppError(anyhow::Error);
@@ -1690,15 +2121,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lobster_income_is_scaled_down_by_thousand() {
-        assert!((lobster_yield_per_hour(1_000_000) - 0.06).abs() < f64::EPSILON);
-        assert!((lobster_yield_per_hour(1_000_000_000) - 60.0).abs() < f64::EPSILON);
+    fn lobster_income_uses_current_market_rate() {
+        assert_eq!(LOBSTER_RATE_TOKEN_UNIT, 100_000_000);
+        assert_eq!(LOBSTER_ACCRUAL_TOKEN_MS_PER_MICRO, 6_000_000);
 
         let position = Vec3::new(1.0, 0.0, 0.0);
         let now = Instant::now();
         let mut player = Player {
             id: "player".to_string(),
             user_id: Some(Uuid::new_v4()),
+            last_seen: now,
             name: "player".to_string(),
             planet_id: 0,
             position,
@@ -1708,11 +2140,13 @@ mod tests {
             jump_height: 0.0,
             jump_velocity: 0.0,
             npc_jump_seconds: 0.0,
-            total_tokens: 1_000_000_000,
+            total_tokens: 100_000_000,
             lobster_micros: 0,
             last_economy_at: now - Duration::from_secs(60),
             equipped_head: "default".to_string(),
             owned_heads: vec!["default".to_string()],
+            owned_pixels: [0; PIXEL_COLOR_COUNT],
+            facing: 0,
             walking_phase: 0,
             npc_movement: None,
         };
@@ -1731,6 +2165,7 @@ mod tests {
                 Player {
                     id: "player".to_string(),
                     user_id: Some(Uuid::new_v4()),
+                    last_seen: Instant::now(),
                     name: "player".to_string(),
                     planet_id: 0,
                     position,
@@ -1752,12 +2187,15 @@ mod tests {
                     last_economy_at: Instant::now(),
                     equipped_head: "default".to_string(),
                     owned_heads: vec!["default".to_string()],
+                    owned_pixels: [0; PIXEL_COLOR_COUNT],
+                    facing: 0,
                     walking_phase: 0,
                     npc_movement: None,
                 },
             )]),
             next_npc_id: 0,
             last_tick: Instant::now(),
+            placed_pixels: HashMap::new(),
         };
 
         for _ in 0..500 {
@@ -1804,6 +2242,7 @@ mod tests {
                     lobster_micros: 0,
                     equipped_head: "default".to_string(),
                     owned_heads: vec!["default".to_string()],
+                    owned_pixels: [0; PIXEL_COLOR_COUNT],
                 },
                 rewards: Vec::new(),
             },
@@ -1841,6 +2280,7 @@ mod tests {
                 Player {
                     id: "npc".to_string(),
                     user_id: None,
+                    last_seen: Instant::now(),
                     name: "npc".to_string(),
                     planet_id: 0,
                     position,
@@ -1855,6 +2295,8 @@ mod tests {
                     last_economy_at: Instant::now(),
                     equipped_head: "default".to_string(),
                     owned_heads: vec!["default".to_string()],
+                    owned_pixels: [0; PIXEL_COLOR_COUNT],
+                    facing: 0,
                     walking_phase: 0,
                     npc_movement: Some(NpcMovement::Idle {
                         remaining_seconds: 0.0,
@@ -1863,6 +2305,7 @@ mod tests {
             )]),
             next_npc_id: 0,
             last_tick: Instant::now(),
+            placed_pixels: HashMap::new(),
         };
 
         for _ in 0..120 {
