@@ -15,7 +15,7 @@ use axum::{
         Path as AxumPath, Query, State, WebSocketUpgrade,
     },
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -69,6 +69,12 @@ struct XCallbackQuery {
     state: Option<String>,
     code: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpectatorFrameQuery {
+    width: Option<u16>,
+    height: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +141,7 @@ struct Player {
     jump_momentum_multiplier: f64,
     npc_jump_seconds: f64,
     total_tokens: u64,
+    all_time_tokens: u64,
     lobster_micros: u64,
     last_economy_at: Instant,
     equipped_head: String,
@@ -148,6 +155,7 @@ struct Player {
 #[derive(Debug, Clone)]
 struct UserEconomy {
     total_tokens: u64,
+    all_time_tokens: u64,
     lobster_micros: u64,
     equipped_head: String,
     owned_heads: Vec<String>,
@@ -158,6 +166,7 @@ struct UserEconomy {
 struct EconomySave {
     user_id: Uuid,
     total_tokens: u64,
+    all_time_tokens: u64,
     lobster_micros: u64,
     equipped_head: String,
     owned_heads: Vec<String>,
@@ -264,6 +273,7 @@ enum ClientMessage {
     },
     TokenUsage {
         total_tokens: u64,
+        all_time_tokens: u64,
     },
     BuyHead {
         item_id: String,
@@ -310,6 +320,7 @@ struct EconomyRulesSnapshot {
 struct LeaderboardEntry {
     username: String,
     lobsters: u64,
+    all_time_tokens: u64,
     profile_url: String,
 }
 
@@ -324,6 +335,7 @@ struct PlayerSnapshot {
     basis_up: [f64; 3],
     fake: bool,
     total_tokens: u64,
+    all_time_tokens: u64,
     lobsters: u64,
     equipped_head: String,
     owned_heads: Vec<String>,
@@ -493,6 +505,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/ws", get(ws))
         .route("/spectate", get(spectate))
+        .route("/spectate-frame", get(spectate_frame))
         .route("/auth/x/start", axum::routing::post(auth_x_start))
         .route("/auth/x/poll/{poll_token}", get(auth_x_poll))
         .route("/auth/x/callback", get(auth_x_callback))
@@ -802,6 +815,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
             Option<String>,
             i64,
             i64,
+            i64,
             Option<DateTime<Utc>>,
             Option<NaiveDate>,
             i32,
@@ -813,7 +827,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
         ),
     >(
         r#"
-        SELECT id, x_username, x_name, total_tokens, lobster_micros, last_lobster_at,
+        SELECT id, x_username, x_name, total_tokens, all_time_tokens, lobster_micros, last_lobster_at,
                last_daily_reward_date, daily_streak_days,
                last_weekly_reward_monday, weekly_streak_weeks,
                equipped_head, owned_heads, owned_pixels
@@ -831,6 +845,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
         username,
         _name,
         total_tokens,
+        all_time_tokens,
         lobster_micros,
         _last_lobster_at,
         last_daily_reward_date,
@@ -847,6 +862,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
 
     let now = Utc::now();
     let total_tokens = total_tokens.max(0) as u64;
+    let all_time_tokens = all_time_tokens.max(0) as u64;
     let mut lobster_micros = lobster_micros.max(0) as u64;
 
     let mut rewards = Vec::new();
@@ -924,21 +940,23 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
         r#"
         UPDATE game_users
         SET total_tokens = $2,
-            lobster_micros = $3,
+            all_time_tokens = $3,
+            lobster_micros = $4,
             last_lobster_at = now(),
-            last_daily_reward_date = $4,
-            daily_streak_days = $5,
-            last_weekly_reward_monday = $6,
-            weekly_streak_weeks = $7,
-            equipped_head = $8,
-            owned_heads = $9,
-            owned_pixels = $10,
+            last_daily_reward_date = $5,
+            daily_streak_days = $6,
+            last_weekly_reward_monday = $7,
+            weekly_streak_weeks = $8,
+            equipped_head = $9,
+            owned_heads = $10,
+            owned_pixels = $11,
             updated_at = now()
         WHERE id = $1
         "#,
     )
     .bind(id)
     .bind(total_tokens as i64)
+    .bind(all_time_tokens as i64)
     .bind(lobster_micros as i64)
     .bind(today)
     .bind(daily_streak_days as i32)
@@ -960,6 +978,7 @@ async fn user_by_api_token(db: &PgPool, token: &str) -> anyhow::Result<Option<Ga
         username,
         economy: UserEconomy {
             total_tokens,
+            all_time_tokens,
             lobster_micros,
             equipped_head,
             owned_heads,
@@ -993,7 +1012,7 @@ fn pixel_inventory_json(inventory: [u64; PIXEL_COLOR_COUNT]) -> Value {
 }
 
 async fn landing_page() -> Response {
-    let page = r#"<!doctype html>
+    let page = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1004,6 +1023,8 @@ async fn landing_page() -> Response {
 * { box-sizing: border-box; }
 html, body { margin: 0; min-height: 100%; background: #1e1e1e; color: #cccccc; }
 body {
+  position: relative;
+  isolation: isolate;
   display: grid;
   grid-template-rows: 1fr auto;
   place-items: center;
@@ -1014,8 +1035,43 @@ body {
   font-style: italic;
   font-weight: 400;
   line-height: 1.45;
+  overflow: hidden;
+}
+.ascii-sky {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  margin: 0;
+  color: #3f4658;
+  background: #1e1e1e;
+  font: inherit;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1;
+  letter-spacing: 0;
+  white-space: pre;
+  pointer-events: none;
+  user-select: none;
+  overflow: hidden;
+}
+.ascii-sky .s0 { color: #465064; }
+.ascii-sky .s1 { color: #6f7d98; }
+.ascii-sky .s2 { color: #d4d4d4; }
+.ascii-sky .po { color: #5fa55f; }
+.ascii-sky .pl { color: #509150; }
+.ascii-sky .pw { color: #2d4b6e; }
+.cell-probe {
+  position: fixed;
+  left: -1000px;
+  top: -1000px;
+  visibility: hidden;
+  font: inherit;
+  font-style: normal;
+  line-height: 1;
 }
 .screen {
+  position: relative;
+  z-index: 10;
   width: min(96vw, 96ch);
   min-height: 0;
   display: grid;
@@ -1024,9 +1080,23 @@ body {
 }
 .term {
   width: min(100%, 72ch);
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
   color: #cccccc;
   text-align: center;
   line-height: inherit;
+}
+.term, .footer {
+  text-shadow:
+    -1ch 0 #1e1e1e, 1ch 0 #1e1e1e,
+    -2ch 0 #1e1e1e, 2ch 0 #1e1e1e,
+    0 -1em #1e1e1e, 0 1em #1e1e1e,
+    0 -2em #1e1e1e, 0 2em #1e1e1e,
+    -1ch -1em #1e1e1e, 1ch -1em #1e1e1e,
+    -1ch 1em #1e1e1e, 1ch 1em #1e1e1e,
+    -2ch -1em #1e1e1e, 2ch -1em #1e1e1e,
+    -2ch 1em #1e1e1e, 2ch 1em #1e1e1e;
 }
 .title { color: #569cd6; font: inherit; font-weight: 400; letter-spacing: 0; }
 .wordmark {
@@ -1040,6 +1110,22 @@ body {
   text-align: center;
   white-space: pre;
   overflow: visible;
+}
+.wordmark-wrap {
+  position: relative;
+  display: inline-block;
+  margin: 0 0 1.45em;
+}
+.wordmark-wrap .wordmark {
+  margin: 0;
+}
+.wordmark-shine {
+  position: absolute;
+  inset: 0;
+  color: #ffffff;
+  pointer-events: none;
+  clip-path: inset(0 100% 0 0);
+  animation: wordmark-shine 4.2s linear infinite;
 }
 .dim { color: #858585; }
 .cmd {
@@ -1111,6 +1197,8 @@ button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
 .c14 { background: #29b8db; }
 .c15 { background: #ffffff; }
 .footer {
+  position: relative;
+  z-index: 10;
   color: #858585;
   text-align: center;
 }
@@ -1119,15 +1207,29 @@ button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
   text-decoration: underline;
   text-underline-offset: .18em;
 }
+@keyframes wordmark-shine {
+  0%, 24% { clip-path: inset(0 100% 0 0); }
+  30% { clip-path: inset(0 88% 0 0); }
+  58% { clip-path: inset(0 0 0 88%); }
+  64%, 100% { clip-path: inset(0 0 0 100%); }
+}
 </style>
 </head>
 <body>
+<pre id="ascii-sky" class="ascii-sky" aria-hidden="true"></pre>
+<span id="cell-probe" class="cell-probe" aria-hidden="true">M</span>
 <main class="screen">
 <section class="term" aria-label="Ascii World landing page">
+<div class="wordmark-wrap">
 <pre class="wordmark" aria-label="Ascii World">   ___           _ _   _      __         __   __
   / _ | ___ ____(_|_) | | /| / /__  ____/ /__/ /
   / __ |(_-&lt;/ __/ / /  | |/ |/ / _ \/ __/ / _  / 
 /_/ |_/___/\__/_/_/   |__/|__/\___/_/ /_/\_,_/</pre>
+<pre class="wordmark wordmark-shine" aria-hidden="true">   ___           _ _   _      __         __   __
+  / _ | ___ ____(_|_) | | /| / /__  ____/ /__/ /
+  / __ |(_-&lt;/ __/ / /  | |/ |/ / _ \/ __/ / _  / 
+/_/ |_/___/\__/_/_/   |__/|__/\___/_/ /_/\_,_/</pre>
+</div>
 <div class="dim">The idle multiplayer game for vibe coders</div>
 <div class="toggle" role="group" aria-label="platform">
 <button type="button" data-platform="mac" aria-pressed="false" aria-label="macOS">🍎</button>
@@ -1145,6 +1247,168 @@ button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
 </main>
 <footer class="footer">Made and hosted by agents on <a href="https://box.ascii.dev">box.ascii.dev</a>, the cheapest and most powerful AI sandboxes</footer>
 <script>
+const sky = document.getElementById("ascii-sky");
+const probe = document.getElementById("cell-probe");
+let skySize = { cols: 0, rows: 0 };
+let lastSkyFrame = 0;
+
+function hash2(x, y, seed) {
+  let value = ((x * 0x8da6b343) ^ (y * 0xd8163841) ^ seed) >>> 0;
+  value ^= value >>> 16;
+  value = Math.imul(value, 0x7feb352d) >>> 0;
+  value ^= value >>> 15;
+  value = Math.imul(value, 0x846ca68b) >>> 0;
+  value ^= value >>> 16;
+  return value >>> 0;
+}
+
+function unit(seed) {
+  return seed / 4294967295;
+}
+
+function smooth(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function valueNoise3(x, y, z) {
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+  const zi = Math.floor(z);
+  const xf = x - xi;
+  const yf = y - yi;
+  const zf = z - zi;
+  const u = smooth(xf);
+  const v = smooth(yf);
+  const w = smooth(zf);
+  const h = (xx, yy, zz) => unit(hash2(xx, yy, 0x9e3779b9 ^ Math.imul(zz, 0x85ebca6b)));
+  const x00 = lerp(h(xi, yi, zi), h(xi + 1, yi, zi), u);
+  const x10 = lerp(h(xi, yi + 1, zi), h(xi + 1, yi + 1, zi), u);
+  const x01 = lerp(h(xi, yi, zi + 1), h(xi + 1, yi, zi + 1), u);
+  const x11 = lerp(h(xi, yi + 1, zi + 1), h(xi + 1, yi + 1, zi + 1), u);
+  return lerp(lerp(x00, x10, v), lerp(x01, x11, v), w) * 2 - 1;
+}
+
+function escapeStar(ch) {
+  return ch === "*" ? "*" : ch;
+}
+
+function vec(x, y, z) {
+  return { x, y, z };
+}
+
+function dot(a, b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+function add(a, b) {
+  return vec(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+function scale(a, s) {
+  return vec(a.x * s, a.y * s, a.z * s);
+}
+
+function cross(a, b) {
+  return vec(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+function normalize(a) {
+  const len = Math.hypot(a.x, a.y, a.z) || 1;
+  return vec(a.x / len, a.y / len, a.z / len);
+}
+
+function rotateY(a, angle) {
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  return vec(a.x * c + a.z * s, a.y, -a.x * s + a.z * c);
+}
+
+function rotateZ(a, angle) {
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  return vec(a.x * c - a.y * s, a.x * s + a.y * c, a.z);
+}
+
+function proceduralLand(p) {
+  const lat = Math.asin(Math.max(-1, Math.min(1, p.z)));
+  const lon = Math.atan2(p.y, p.x);
+  const n1 = valueNoise3(lon * 1.7 + 2.0, lat * 3.1, 0.15);
+  const n2 = valueNoise3(lon * 3.4 - 1.5, lat * 5.8 + 4.0, 1.7) * 0.42;
+  const n3 = valueNoise3(lon * 7.5 + 0.7, lat * 9.0 - 2.0, 3.1) * 0.18;
+  const polar = Math.abs(lat) > 1.18 ? 0.55 : 0;
+  return n1 + n2 + n3 + polar > 0.05;
+}
+
+function landChar(p) {
+  const lat = Math.asin(Math.max(-1, Math.min(1, p.z)));
+  if (Math.abs(lat) > 1.15) {
+    return "*";
+  }
+  return Math.sin(lat * 31 + p.x * 17 + p.y * 13) > 0.25 ? "#" : "+";
+}
+
+function skyCell(x, y, time) {
+  const seed = hash2(x, y, 0x5f3759df);
+  const placement = unit(seed);
+  const large = placement < 0.0022;
+  const small = placement < 0.019;
+  if (!large && !small) {
+    return " ";
+  }
+  if (large) {
+    const phase = unit(seed ^ 0x9e3779b9) * 12;
+    const noise = valueNoise3(x * 0.075, y * 0.12, time * 0.18 + phase);
+    const level = Math.max(0, Math.min(2, Math.floor((noise + 1) * 1.5)));
+    const ch = level === 0 ? "+" : "*";
+    return `<span class="s${level}">${escapeStar(ch)}</span>`;
+  }
+  const level = placement < 0.006 ? 1 : 0;
+  return `<span class="s${level}">.</span>`;
+}
+
+function measureSky() {
+  const rect = probe.getBoundingClientRect();
+  const cellW = Math.max(1, rect.width);
+  const cellH = Math.max(1, rect.height);
+  skySize = {
+    cols: Math.ceil(window.innerWidth / cellW),
+    rows: Math.ceil(window.innerHeight / cellH)
+  };
+}
+
+async function renderSky(now) {
+  if (now - lastSkyFrame < 90) {
+    requestAnimationFrame(renderSky);
+    return;
+  }
+  lastSkyFrame = now;
+  if (skySize.cols <= 0 || skySize.rows <= 0) {
+    measureSky();
+  }
+  try {
+    const response = await fetch(`/spectate-frame?width=${skySize.cols}&height=${skySize.rows}`, {
+      cache: "no-store"
+    });
+    if (response.ok) {
+      sky.innerHTML = await response.text();
+    }
+  } catch {
+    // Keep the previous frame visible if the server restarts between polls.
+  }
+  requestAnimationFrame(renderSky);
+}
+
+window.addEventListener("resize", () => {
+  measureSky();
+  lastSkyFrame = 0;
+});
+measureSky();
+requestAnimationFrame(renderSky);
+
 const origin = window.location.origin;
 const commands = {
   mac: {
@@ -1175,7 +1439,7 @@ for (const button of document.querySelectorAll("button[data-platform]")) {
 pick(navigator.platform.toLowerCase().includes("win") ? "windows" : navigator.platform.toLowerCase().includes("mac") ? "mac" : "linux");
 </script>
 </body>
-</html>"#;
+</html>"##;
     ([("content-type", "text/html; charset=utf-8")], page).into_response()
 }
 
@@ -1222,6 +1486,113 @@ async fn ws(
 
 async fn spectate(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_spectator_ws(socket, state))
+}
+
+async fn spectate_frame(
+    Query(query): Query<SpectatorFrameQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let width = query.width.unwrap_or(120).clamp(40, 240);
+    let height = query.height.unwrap_or(40).clamp(18, 80);
+    let leaderboard = fetch_lobster_leaderboard(&state.db)
+        .await
+        .unwrap_or_default();
+    let snapshot = {
+        let world = state.game.world.lock().await;
+        snapshot_world(&world, leaderboard)
+    };
+    Html(render_spectator_frame_html(&snapshot, width, height))
+}
+
+fn render_spectator_frame_html(snapshot: &Snapshot, width: u16, height: u16) -> String {
+    let reward_by_player =
+        snapshot
+            .pickup_rewards
+            .iter()
+            .fold(HashMap::<&str, u64>::new(), |mut rewards, reward| {
+                *rewards.entry(reward.player_id.as_str()).or_default() += reward.lobsters;
+                rewards
+            });
+    let camera_focus = world_render::Vec3::X;
+    let camera_up = world_render::stable_camera_up(camera_focus);
+    let players = snapshot
+        .players
+        .iter()
+        .filter(|player| player.planet_id == 0)
+        .filter_map(|player| {
+            let position = world_render::Vec3::from_array(player.position)?;
+            Some(world_render::VisiblePlayer {
+                name: player.name.clone(),
+                position,
+                is_self: false,
+                is_fake: player.fake,
+                points: player.all_time_tokens,
+                lobsters: player.lobsters,
+                lobster_yield_per_hour: player.total_tokens as f64
+                    / snapshot.economy_rules.lobster_rate_token_unit as f64
+                    * 60.0,
+                equipped_head: world_render::equipped_head_glyph(&player.equipped_head).to_string(),
+                jump_height: player.jump_height,
+                jump_leg_pose: player.jump_leg_pose,
+                pickup_reward_lobsters: reward_by_player
+                    .get(player.id.as_str())
+                    .copied()
+                    .unwrap_or(0),
+                facing: player.facing,
+                walking_phase: player.walking_phase,
+            })
+        })
+        .collect();
+    let state = world_render::VisibleGameState {
+        width,
+        height,
+        planet_diameter_cells: 90.0,
+        camera_focus,
+        camera_up,
+        tokens_since_joining: 0,
+        tokens_all_time: 0,
+        lobsters: 0,
+        lobster_yield_per_hour: 0.0,
+        leaderboard: snapshot
+            .leaderboard
+            .iter()
+            .map(|entry| world_render::LeaderboardEntry {
+                username: entry.username.clone(),
+                lobsters: entry.lobsters,
+                all_time_tokens: entry.all_time_tokens,
+                profile_url: entry.profile_url.clone(),
+            })
+            .collect(),
+        placed_pixels: snapshot
+            .placed_pixels
+            .iter()
+            .map(|pixel| world_render::PlacedPixel {
+                position: pixel.position,
+                color: pixel.color,
+            })
+            .collect(),
+        pickups: snapshot
+            .pickups
+            .iter()
+            .map(|pickup| world_render::PickupSnapshot {
+                position: pickup.position,
+                emoji: pickup.emoji.clone(),
+            })
+            .collect(),
+        players,
+    };
+    let frame = world_render::render_game_frame(
+        &state,
+        world_render::GameRenderOptions {
+            show_header: false,
+            show_footer: false,
+            show_pixel_inventory: false,
+            show_lobster_leaderboard: false,
+        },
+        0,
+        [0; world_render::PIXEL_COLOR_COUNT],
+    );
+    world_render::frame_to_html(&frame)
 }
 
 async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
@@ -1277,9 +1648,14 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
                                     )
                                     .await;
                             }
-                            Ok(ClientMessage::TokenUsage { total_tokens }) => {
-                                if let Some(save) =
-                                    state.game.set_total_tokens(&player_id, total_tokens).await
+                            Ok(ClientMessage::TokenUsage {
+                                total_tokens,
+                                all_time_tokens,
+                            }) => {
+                                if let Some(save) = state
+                                    .game
+                                    .set_token_totals(&player_id, total_tokens, all_time_tokens)
+                                    .await
                                 {
                                     if let Err(err) = persist_economy(&state.db, save).await {
                                         error!("failed to persist token usage: {err}");
@@ -1409,17 +1785,19 @@ async fn persist_economy(db: &PgPool, save: EconomySave) -> anyhow::Result<()> {
         r#"
         UPDATE game_users
         SET total_tokens = GREATEST(total_tokens, $2),
-            lobster_micros = $3,
+            all_time_tokens = GREATEST(all_time_tokens, $3),
+            lobster_micros = $4,
             last_lobster_at = now(),
-            equipped_head = $4,
-            owned_heads = $5,
-            owned_pixels = $6,
+            equipped_head = $5,
+            owned_heads = $6,
+            owned_pixels = $7,
             updated_at = now()
         WHERE id = $1
         "#,
     )
     .bind(save.user_id)
     .bind(save.total_tokens as i64)
+    .bind(save.all_time_tokens as i64)
     .bind(save.lobster_micros as i64)
     .bind(save.equipped_head)
     .bind(Value::Array(
@@ -1475,6 +1853,7 @@ impl Game {
             position,
             basis_up,
             total_tokens,
+            all_time_tokens,
             lobster_micros,
             equipped_head,
             owned_heads,
@@ -1494,6 +1873,7 @@ impl Game {
             replaced_save = player.user_id.map(|user_id| EconomySave {
                 user_id,
                 total_tokens: player.total_tokens,
+                all_time_tokens: player.all_time_tokens,
                 lobster_micros: player.lobster_micros,
                 equipped_head: player.equipped_head.clone(),
                 owned_heads: player.owned_heads.clone(),
@@ -1503,6 +1883,7 @@ impl Game {
                 player.position,
                 player.basis_up,
                 player.total_tokens,
+                player.all_time_tokens,
                 player.lobster_micros,
                 player.equipped_head,
                 player.owned_heads,
@@ -1527,6 +1908,7 @@ impl Game {
                 position,
                 position.any_tangent(),
                 user.economy.total_tokens,
+                user.economy.all_time_tokens,
                 user.economy.lobster_micros,
                 user.economy.equipped_head,
                 user.economy.owned_heads,
@@ -1566,6 +1948,7 @@ impl Game {
                 jump_momentum_multiplier,
                 npc_jump_seconds: 0.0,
                 total_tokens,
+                all_time_tokens,
                 lobster_micros,
                 last_economy_at: Instant::now(),
                 equipped_head,
@@ -1589,6 +1972,7 @@ impl Game {
             player.user_id.map(|user_id| EconomySave {
                 user_id,
                 total_tokens: player.total_tokens,
+                all_time_tokens: player.all_time_tokens,
                 lobster_micros: player.lobster_micros,
                 equipped_head: player.equipped_head,
                 owned_heads: player.owned_heads,
@@ -1627,15 +2011,22 @@ impl Game {
         }
     }
 
-    async fn set_total_tokens(&self, id: &str, total_tokens: u64) -> Option<EconomySave> {
+    async fn set_token_totals(
+        &self,
+        id: &str,
+        total_tokens: u64,
+        all_time_tokens: u64,
+    ) -> Option<EconomySave> {
         let mut world = self.world.lock().await;
         let player = world.players.get_mut(id)?;
         player.last_seen = Instant::now();
         accrue_lobsters(player, Instant::now());
         player.total_tokens = player.total_tokens.max(total_tokens);
+        player.all_time_tokens = player.all_time_tokens.max(all_time_tokens);
         player.user_id.map(|user_id| EconomySave {
             user_id,
             total_tokens: player.total_tokens,
+            all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
@@ -1666,6 +2057,7 @@ impl Game {
         player.user_id.map(|user_id| EconomySave {
             user_id,
             total_tokens: player.total_tokens,
+            all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
@@ -1688,6 +2080,7 @@ impl Game {
         player.user_id.map(|user_id| EconomySave {
             user_id,
             total_tokens: player.total_tokens,
+            all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
@@ -1712,6 +2105,7 @@ impl Game {
         player.user_id.map(|user_id| EconomySave {
             user_id,
             total_tokens: player.total_tokens,
+            all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
@@ -1734,6 +2128,7 @@ impl Game {
         let save = player.user_id.map(|user_id| EconomySave {
             user_id,
             total_tokens: player.total_tokens,
+            all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
@@ -1784,9 +2179,9 @@ async fn run_game_loop(game: GameHandle, db: PgPool) {
 }
 
 async fn fetch_lobster_leaderboard(db: &PgPool) -> anyhow::Result<Vec<LeaderboardEntry>> {
-    let rows = sqlx::query_as::<_, (String, i64)>(
+    let rows = sqlx::query_as::<_, (String, i64, i64)>(
         r#"
-        SELECT x_username, lobster_micros
+        SELECT x_username, lobster_micros, all_time_tokens
         FROM game_users
         WHERE x_username <> ''
         ORDER BY lobster_micros DESC, lower(x_username) ASC
@@ -1798,12 +2193,13 @@ async fn fetch_lobster_leaderboard(db: &PgPool) -> anyhow::Result<Vec<Leaderboar
 
     Ok(rows
         .into_iter()
-        .map(|(username, lobster_micros)| {
+        .map(|(username, lobster_micros, all_time_tokens)| {
             let username = username.trim().trim_start_matches('@').to_string();
             LeaderboardEntry {
                 profile_url: format!("https://x.com/{username}"),
                 username,
                 lobsters: lobster_balance(lobster_micros.max(0) as u64),
+                all_time_tokens: all_time_tokens.max(0) as u64,
             }
         })
         .filter(|entry| !entry.username.is_empty())
@@ -1829,7 +2225,6 @@ const JUMP_IMPULSE_CELLS_PER_SECOND: f64 = 7.6;
 const JUMP_GRAVITY_CELLS_PER_SECOND2: f64 = 19.0;
 const MAX_JUMP_HEIGHT_CELLS: f64 = 2.0;
 const JUMP_GROUND_EPSILON: f64 = 0.02;
-const JUMP_CHAIN_WINDOW: Duration = Duration::from_millis(500);
 const THIRD_MOMENTUM_JUMP_MULTIPLIER: f64 = 6.0;
 const NPC_NAMES: &[&str] = &[
     "Coco", "Lulu", "Rico", "Fifi", "Toto", "Mimi", "Pepe", "Gigi", "Bibi", "Nono", "Kiki", "Zaza",
@@ -1949,6 +2344,7 @@ fn spawn_npc(world: &mut GameWorld, rng: &mut impl Rng) {
             jump_momentum_multiplier: 1.0,
             npc_jump_seconds: random_npc_jump_seconds(rng),
             total_tokens: 0,
+            all_time_tokens: 0,
             lobster_micros: 0,
             last_economy_at: Instant::now(),
             equipped_head: "default".to_string(),
@@ -1992,24 +2388,20 @@ fn start_player_jump(player: &mut Player, input: InputState) {
 
     let pose = jump_leg_pose_from_input(input);
     let has_direction_input = input.up || input.down || input.left || input.right;
+    let continues_momentum_chain = player.last_jump_momentum.is_some();
     if has_direction_input {
         player.jump_leg_pose = pose;
-        player.jump_momentum = None;
-        player.momentum_jump_chain = 1;
-        player.jump_momentum_multiplier = 1.0;
-    } else if player
-        .last_jump_started_at
-        .and_then(|started_at| now.checked_duration_since(started_at))
-        .is_some_and(|elapsed| elapsed <= JUMP_CHAIN_WINDOW)
-        && player.last_jump_momentum.is_some()
-    {
+        player.jump_momentum = player.last_jump_momentum;
+        player.momentum_jump_chain = if continues_momentum_chain {
+            player.momentum_jump_chain.saturating_add(1).max(1)
+        } else {
+            1
+        };
+        player.jump_momentum_multiplier = momentum_jump_multiplier(player.momentum_jump_chain);
+    } else if continues_momentum_chain {
         player.jump_momentum = player.last_jump_momentum;
         player.momentum_jump_chain = player.momentum_jump_chain.saturating_add(1).max(1);
-        player.jump_momentum_multiplier = if player.momentum_jump_chain == 3 {
-            THIRD_MOMENTUM_JUMP_MULTIPLIER
-        } else {
-            1.0
-        };
+        player.jump_momentum_multiplier = momentum_jump_multiplier(player.momentum_jump_chain);
         if player.jump_leg_pose == 0 || player.jump_leg_pose == 1 {
             player.jump_leg_pose = jump_leg_pose_from_momentum(player);
         }
@@ -2025,6 +2417,14 @@ fn start_player_jump(player: &mut Player, input: InputState) {
     }
 
     player.last_jump_started_at = Some(now);
+}
+
+fn momentum_jump_multiplier(chain: u8) -> f64 {
+    if chain > 0 && chain % 3 == 0 {
+        THIRD_MOMENTUM_JUMP_MULTIPLIER
+    } else {
+        1.0
+    }
 }
 
 fn jump_leg_pose_from_input(input: InputState) -> i8 {
@@ -2045,12 +2445,34 @@ fn jump_leg_pose_from_momentum(player: &Player) -> i8 {
     let Some(momentum) = player.last_jump_momentum else {
         return player.jump_leg_pose;
     };
-    let right = player.basis_up.cross(player.position).normalize();
+    let right = screen_right_for_player(player);
     if momentum.dot(right) < 0.0 {
         -1
     } else {
         2
     }
+}
+
+fn screen_up_for_player(player: &Player) -> Vec3 {
+    let camera_up = player
+        .input
+        .camera_up
+        .and_then(Vec3::from_array)
+        .unwrap_or(player.basis_up);
+    let screen_up = camera_up
+        .add(player.position.scale(-camera_up.dot(player.position)))
+        .normalize();
+    if screen_up.length() <= 1e-6 {
+        player.basis_up
+    } else {
+        screen_up
+    }
+}
+
+fn screen_right_for_player(player: &Player) -> Vec3 {
+    screen_up_for_player(player)
+        .cross(player.position)
+        .normalize()
 }
 
 fn tick_world(world: &mut GameWorld, dt: f64) -> Vec<EconomySave> {
@@ -2059,20 +2481,8 @@ fn tick_world(world: &mut GameWorld, dt: f64) -> Vec<EconomySave> {
     for player in world.players.values_mut().filter(|player| !player.fake) {
         accrue_lobsters(player, economy_now);
         tick_jump(player, dt);
-        let camera_up = player
-            .input
-            .camera_up
-            .and_then(Vec3::from_array)
-            .unwrap_or(player.basis_up);
-        let screen_up = camera_up
-            .add(player.position.scale(-camera_up.dot(player.position)))
-            .normalize();
-        let screen_up = if screen_up.length() <= 1e-6 {
-            player.basis_up
-        } else {
-            screen_up
-        };
-        let screen_right = screen_up.cross(player.position).normalize();
+        let screen_up = screen_up_for_player(player);
+        let screen_right = screen_right_for_player(player);
         let mut direction = Vec3::new(0.0, 0.0, 0.0);
         if player.input.up {
             direction = direction.add(screen_up);
@@ -2125,7 +2535,8 @@ fn tick_world(world: &mut GameWorld, dt: f64) -> Vec<EconomySave> {
             player.basis_up = transported_up
                 .add(player.position.scale(-transported_up.dot(player.position)))
                 .normalize();
-            update_facing_from_movement(player, previous_position, player.position);
+            let screen_right = screen_right_for_player(player);
+            update_facing_from_movement(player, previous_position, player.position, screen_right);
             player.walking_phase = player.walking_phase.wrapping_add(1);
         }
     }
@@ -2206,6 +2617,7 @@ fn economy_save(player: &Player) -> Option<EconomySave> {
     player.user_id.map(|user_id| EconomySave {
         user_id,
         total_tokens: player.total_tokens,
+        all_time_tokens: player.all_time_tokens,
         lobster_micros: player.lobster_micros,
         equipped_head: player.equipped_head.clone(),
         owned_heads: player.owned_heads.clone(),
@@ -2366,18 +2778,26 @@ fn move_player_to_position(player: &mut Player, next_position: Vec3) {
     player.basis_up = transported_up
         .add(player.position.scale(-transported_up.dot(player.position)))
         .normalize();
-    update_facing_from_movement(player, previous_position, player.position);
+    let local_right = player.basis_up.cross(player.position).normalize();
+    update_facing_from_movement(player, previous_position, player.position, local_right);
 }
 
-fn update_facing_from_movement(player: &mut Player, previous_position: Vec3, next_position: Vec3) {
+fn update_facing_from_movement(
+    player: &mut Player,
+    previous_position: Vec3,
+    next_position: Vec3,
+    right_basis: Vec3,
+) {
     let delta = next_position.add(previous_position.scale(-1.0));
     let movement = delta.add(next_position.scale(-delta.dot(next_position)));
     if movement.length() <= 1e-9 {
         return;
     }
 
-    let local_right = player.basis_up.cross(next_position).normalize();
-    let right_amount = movement.normalize().dot(local_right);
+    let right_basis = right_basis
+        .add(next_position.scale(-right_basis.dot(next_position)))
+        .normalize();
+    let right_amount = movement.normalize().dot(right_basis);
     if right_amount > 0.15 {
         player.facing = 1;
     } else if right_amount < -0.15 {
@@ -2401,6 +2821,7 @@ fn snapshot_world(world: &GameWorld, leaderboard: Vec<LeaderboardEntry>) -> Snap
                 basis_up: player.basis_up.to_array(),
                 fake: player.fake,
                 total_tokens: player.total_tokens,
+                all_time_tokens: player.all_time_tokens,
                 lobsters: lobster_balance(player.lobster_micros),
                 equipped_head: player.equipped_head.clone(),
                 owned_heads: player.owned_heads.clone(),
@@ -2567,6 +2988,7 @@ mod tests {
             jump_momentum_multiplier: 1.0,
             npc_jump_seconds: 0.0,
             total_tokens: 1_000_000,
+            all_time_tokens: 1_000_000,
             lobster_micros: 0,
             last_economy_at: now - Duration::from_secs(60 * 60),
             equipped_head: "default".to_string(),
@@ -2615,6 +3037,7 @@ mod tests {
                     jump_momentum_multiplier: 1.0,
                     npc_jump_seconds: 0.0,
                     total_tokens: 0,
+                    all_time_tokens: 0,
                     lobster_micros: 0,
                     last_economy_at: Instant::now(),
                     equipped_head: "default".to_string(),
@@ -2675,6 +3098,7 @@ mod tests {
                 username: "real".to_string(),
                 economy: UserEconomy {
                     total_tokens: 0,
+                    all_time_tokens: 0,
                     lobster_micros: 0,
                     equipped_head: "default".to_string(),
                     owned_heads: vec!["default".to_string()],
@@ -2716,6 +3140,7 @@ mod tests {
             username: "real".to_string(),
             economy: UserEconomy {
                 total_tokens: 0,
+                all_time_tokens: 0,
                 lobster_micros: 0,
                 equipped_head: "default".to_string(),
                 owned_heads: vec!["default".to_string()],
@@ -2754,7 +3179,7 @@ mod tests {
     }
 
     #[test]
-    fn movement_updates_facing_in_local_tangent_frame() {
+    fn movement_updates_facing_in_screen_tangent_frame() {
         let position = Vec3::new(1.0, 0.0, 0.0);
         let mut player = Player {
             id: "player".to_string(),
@@ -2776,6 +3201,7 @@ mod tests {
             jump_momentum_multiplier: 1.0,
             npc_jump_seconds: 0.0,
             total_tokens: 0,
+            all_time_tokens: 0,
             lobster_micros: 0,
             last_economy_at: Instant::now(),
             equipped_head: "default".to_string(),
@@ -2786,11 +3212,35 @@ mod tests {
             npc_movement: None,
         };
 
-        update_facing_from_movement(&mut player, position, Vec3::new(1.0, 0.2, 0.0).normalize());
+        let right = Vec3::new(0.0, 1.0, 0.0);
+        update_facing_from_movement(
+            &mut player,
+            position,
+            Vec3::new(1.0, 0.2, 0.0).normalize(),
+            right,
+        );
         assert_eq!(player.facing, 1);
 
-        update_facing_from_movement(&mut player, position, Vec3::new(1.0, -0.2, 0.0).normalize());
+        update_facing_from_movement(
+            &mut player,
+            position,
+            Vec3::new(1.0, -0.2, 0.0).normalize(),
+            right,
+        );
         assert_eq!(player.facing, -1);
+
+        player.position = Vec3::new(-1.0, 0.0, 0.0);
+        player.basis_up = Vec3::new(0.0, 0.0, -1.0);
+        player.input.camera_up = Some(Vec3::Z.to_array());
+        let far_side_position = player.position;
+        let far_side_right = screen_right_for_player(&player);
+        update_facing_from_movement(
+            &mut player,
+            far_side_position,
+            Vec3::new(-1.0, -0.2, 0.0).normalize(),
+            far_side_right,
+        );
+        assert_eq!(player.facing, 1);
     }
 
     #[test]
@@ -2816,6 +3266,7 @@ mod tests {
             jump_momentum_multiplier: 1.0,
             npc_jump_seconds: 0.0,
             total_tokens: 0,
+            all_time_tokens: 0,
             lobster_micros: 0,
             last_economy_at: Instant::now(),
             equipped_head: "default".to_string(),
@@ -2850,6 +3301,38 @@ mod tests {
             player.jump_momentum_multiplier,
             THIRD_MOMENTUM_JUMP_MULTIPLIER
         );
+
+        player.jump_height = 0.0;
+        player.jump_velocity = 0.0;
+        player.momentum_jump_chain = 2;
+        player.jump_momentum_multiplier = 1.0;
+        player.last_jump_momentum = Some(momentum);
+
+        start_player_jump(
+            &mut player,
+            InputState {
+                right: true,
+                ..InputState::default()
+            },
+        );
+        assert_eq!(player.momentum_jump_chain, 3);
+        assert_eq!(
+            player.jump_momentum_multiplier,
+            THIRD_MOMENTUM_JUMP_MULTIPLIER
+        );
+
+        for expected_chain in 4..=6 {
+            player.jump_height = 0.0;
+            player.jump_velocity = 0.0;
+            player.jump_momentum_multiplier = 1.0;
+            player.last_jump_momentum = Some(momentum);
+            start_player_jump(&mut player, InputState::default());
+            assert_eq!(player.momentum_jump_chain, expected_chain);
+        }
+        assert_eq!(
+            player.jump_momentum_multiplier,
+            THIRD_MOMENTUM_JUMP_MULTIPLIER
+        );
     }
 
     #[test]
@@ -2878,6 +3361,7 @@ mod tests {
                     jump_momentum_multiplier: 1.0,
                     npc_jump_seconds: 0.0,
                     total_tokens: 0,
+                    all_time_tokens: 0,
                     lobster_micros: 0,
                     last_economy_at: Instant::now(),
                     equipped_head: "default".to_string(),

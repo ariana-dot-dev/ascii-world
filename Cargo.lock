@@ -193,6 +193,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "world-render",
 ]
 
 [[package]]
@@ -339,6 +340,7 @@ dependencies = [
  "url",
  "walkdir",
  "webbrowser",
+ "world-render",
 ]
 
 [[package]]
@@ -3398,6 +3400,13 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "world-render"
+version = "0.1.0"
+dependencies = [
+ "unicode-width",
 ]
 
 [[package]]

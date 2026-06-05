@@ -25,3 +25,4 @@ unicode-width = "0.2"
 url = "2.5"
 walkdir = "2.5"
 webbrowser = "1.0"
+world-render = { path = "../world-render" }

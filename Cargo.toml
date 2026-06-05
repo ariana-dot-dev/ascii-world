@@ -1,7 +1,6 @@
 [workspace]
-members = ["backend", "cli"]
+members = ["backend", "cli", "world-render"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
-

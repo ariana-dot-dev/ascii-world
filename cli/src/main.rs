@@ -32,12 +32,14 @@ const ONBOARDING_VERSION: u32 = 3;
 const PIXEL_COLOR_COUNT: usize = 5;
 const JUMP_GROUND_EPSILON: f64 = 0.02;
 const CAMERA_FOLLOW_STIFFNESS: f64 = 3.6;
+const CAMERA_CENTERING_STIFFNESS: f64 = 0.55;
 const CAMERA_FOLLOW_DAMPING: f64 = 5.4;
 const CAMERA_PREDICTION_SECONDS: f64 = 0.9;
 const CAMERA_MAX_PREDICTION_RADIANS: f64 = 0.34;
 const CAMERA_MAX_SPEED_RADIANS_PER_SECOND: f64 = 0.95;
 const CAMERA_MAX_LAG_RADIANS: f64 = 0.92;
 const CAMERA_SOFT_LAG_RADIANS: f64 = 0.58;
+const HEADER_CONTROLS: &str = "arrows move, space jumps, M market, esc exits";
 const FOOTER_TEXT: &str =
     "Made and hosted by agents on https://box.ascii.dev, the cheapest and most powerful AI sandboxes";
 
@@ -123,8 +125,14 @@ struct LoginPollResponse {
 }
 
 struct TokenScanWorker {
-    receiver: std_mpsc::Receiver<ai_usage::UsageSnapshot>,
+    receiver: std_mpsc::Receiver<TokenScanSnapshot>,
     stop: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TokenScanSnapshot {
+    since_joining: ai_usage::UsageSnapshot,
+    all_time: ai_usage::UsageSnapshot,
 }
 
 impl TokenScanWorker {
@@ -138,8 +146,11 @@ impl TokenScanWorker {
         let stop_thread = stop.clone();
         thread::spawn(move || {
             while !stop_thread.load(Ordering::Relaxed) {
-                let snapshot =
-                    ai_usage::scan_enabled(&detected, &enabled).saturating_sub(baseline.as_ref());
+                let all_time = ai_usage::scan_enabled(&detected, &enabled);
+                let snapshot = TokenScanSnapshot {
+                    since_joining: all_time.saturating_sub(baseline.as_ref()),
+                    all_time,
+                };
                 if tx.send(snapshot).is_err() {
                     break;
                 }
@@ -221,7 +232,8 @@ async fn run_client(
     let mut last_sent = InputState::default();
     let mut last_input_send = Instant::now() - Duration::from_millis(50);
     let mut last_frame = Instant::now() - Duration::from_millis(16);
-    let mut token_delta = ai_usage::UsageSnapshot::default();
+    let mut tokens_since_joining = ai_usage::UsageSnapshot::default();
+    let mut tokens_all_time = ai_usage::UsageSnapshot::default();
     let mut last_reported_tokens: Option<u64> = None;
     let mut last_token_report = Instant::now() - Duration::from_secs(5);
     let mut reward_dialog_closed = false;
@@ -496,10 +508,12 @@ async fn run_client(
                 .clamp(0.0, 0.05);
             if let Some(worker) = &token_worker {
                 while let Ok(snapshot) = worker.receiver.try_recv() {
-                    token_delta = snapshot;
+                    tokens_since_joining = snapshot.since_joining;
+                    tokens_all_time = snapshot.all_time;
                 }
             }
-            let token_total = token_delta.total_tokens();
+            let token_total = tokens_since_joining.total_tokens();
+            let all_time_token_total = tokens_all_time.total_tokens();
             if matches!(phase, ClientPhase::Playing)
                 && (last_reported_tokens != Some(token_total)
                     || last_token_report.elapsed() >= Duration::from_secs(2))
@@ -507,6 +521,7 @@ async fn run_client(
                 if let Some(tx) = &player_tx {
                     let _ = tx.send(ClientMessage::TokenUsage {
                         total_tokens: token_total,
+                        all_time_tokens: all_time_token_total,
                     });
                     last_reported_tokens = Some(token_total);
                     last_token_report = Instant::now();
@@ -526,8 +541,15 @@ async fn run_client(
             if rewards_visible && reward_dialog_opened_at.is_none() {
                 reward_dialog_opened_at = Some(Instant::now());
             }
-            let visible =
-                VisibleGameState::from_client_state(&live_state, &mut camera, cols, rows, frame_dt);
+            let visible = VisibleGameState::from_client_state(
+                &live_state,
+                &mut camera,
+                cols,
+                rows,
+                frame_dt,
+                token_total,
+                all_time_token_total,
+            );
             let self_pixels = live_state
                 .self_player()
                 .map(|player| player.owned_pixels)
@@ -874,6 +896,7 @@ enum ClientMessage {
     },
     TokenUsage {
         total_tokens: u64,
+        all_time_tokens: u64,
     },
     BuyHead {
         item_id: String,
@@ -938,6 +961,7 @@ fn pixel_shortcut(ch: char) -> Option<usize> {
 struct LeaderboardEntry {
     username: String,
     lobsters: u64,
+    all_time_tokens: u64,
     profile_url: String,
 }
 
@@ -952,6 +976,7 @@ struct PlayerSnapshot {
     position: Option<[f64; 3]>,
     fake: bool,
     total_tokens: u64,
+    all_time_tokens: u64,
     lobsters: u64,
     equipped_head: String,
     owned_heads: Vec<String>,
@@ -1192,7 +1217,8 @@ struct VisibleGameState {
     planet_diameter_cells: f64,
     camera_focus: Vec3,
     camera_up: Vec3,
-    token_delta: u64,
+    tokens_since_joining: u64,
+    tokens_all_time: u64,
     lobsters: u64,
     lobster_yield_per_hour: f64,
     leaderboard: Vec<LeaderboardEntry>,
@@ -1225,6 +1251,8 @@ impl VisibleGameState {
         width: u16,
         height: u16,
         dt: f64,
+        tokens_since_joining: u64,
+        tokens_all_time: u64,
     ) -> Self {
         let Some(snapshot) = state.snapshot.clone() else {
             return Self {
@@ -1233,7 +1261,8 @@ impl VisibleGameState {
                 planet_diameter_cells: 90.0,
                 camera_focus: camera.focus,
                 camera_up: camera.up,
-                token_delta: 0,
+                tokens_since_joining: 0,
+                tokens_all_time: 0,
                 lobsters: 0,
                 lobster_yield_per_hour: 0.0,
                 leaderboard: Vec::new(),
@@ -1271,7 +1300,7 @@ impl VisibleGameState {
                         .map(|self_id| self_id == &player.id)
                         .unwrap_or(false),
                     is_fake: player.fake,
-                    points: player.total_tokens,
+                    points: player.all_time_tokens,
                     lobsters: player.lobsters,
                     lobster_yield_per_hour: lobster_yield_per_hour(
                         player.total_tokens,
@@ -1309,7 +1338,8 @@ impl VisibleGameState {
             planet_diameter_cells: 90.0,
             camera_focus: camera.focus,
             camera_up: camera.up,
-            token_delta: self_economy.2,
+            tokens_since_joining,
+            tokens_all_time,
             lobsters: self_economy.0,
             lobster_yield_per_hour: self_economy.1,
             leaderboard: snapshot.leaderboard,
@@ -1326,21 +1356,47 @@ fn update_camera_follow(camera: &mut CameraState, self_position: Vec3, dt: f64) 
     }
 
     camera.focus = camera.focus.normalize();
-    let target = self_position.normalize();
+    let current_self_position = self_position.normalize();
+    let target = predicted_camera_target(camera, current_self_position, dt);
     let tangent_to_target = target.add(camera.focus.scale(-target.dot(camera.focus)));
     let distance = tangent_to_target.length();
 
     let mut angle = camera.focus.dot(target).clamp(-1.0, 1.0).acos();
     if distance > 1e-6 && angle.is_finite() {
         let direction = tangent_to_target.scale(1.0 / distance);
-        let acceleration = direction
-            .scale(angle * CAMERA_FOLLOW_STIFFNESS)
-            .add(camera.velocity.scale(-CAMERA_FOLLOW_DAMPING));
-        camera.velocity = camera.velocity.add(acceleration.scale(dt));
-    } else {
+        let soft_angle = (angle - CAMERA_SOFT_LAG_RADIANS).max(0.0);
+        camera.velocity = camera.velocity.add(
+            direction
+                .scale(soft_angle * CAMERA_FOLLOW_STIFFNESS)
+                .scale(dt),
+        );
+    }
+
+    let tangent_to_self =
+        current_self_position.add(camera.focus.scale(-current_self_position.dot(camera.focus)));
+    let self_distance = tangent_to_self.length();
+    let self_angle = camera
+        .focus
+        .dot(current_self_position)
+        .clamp(-1.0, 1.0)
+        .acos();
+    if self_distance > 1e-6 && self_angle.is_finite() {
+        let center_direction = tangent_to_self.scale(1.0 / self_distance);
+        camera.velocity = camera.velocity.add(
+            center_direction
+                .scale(self_angle * CAMERA_CENTERING_STIFFNESS)
+                .scale(dt),
+        );
+    }
+
+    if distance <= 1e-6 || !angle.is_finite() {
         camera.velocity = camera
             .velocity
             .scale((1.0 - CAMERA_FOLLOW_DAMPING * dt).max(0.0));
+    } else {
+        camera.velocity = camera
+            .velocity
+            .add(camera.velocity.scale(-CAMERA_FOLLOW_DAMPING * dt));
     }
 
     camera.velocity = camera
@@ -1378,6 +1434,32 @@ fn update_camera_follow(camera: &mut CameraState, self_position: Vec3, dt: f64) 
             .add(camera.focus.scale(-camera.velocity.dot(camera.focus)))
             .scale(0.65);
     }
+
+    camera.previous_self_position = Some(current_self_position);
+}
+
+fn predicted_camera_target(camera: &CameraState, self_position: Vec3, dt: f64) -> Vec3 {
+    let Some(previous) = camera.previous_self_position else {
+        return self_position;
+    };
+    if dt <= 0.0 {
+        return self_position;
+    }
+
+    let motion_distance = previous.dot(self_position).clamp(-1.0, 1.0).acos();
+    let tangent_motion = self_position
+        .scale(previous.dot(self_position))
+        .add(previous.scale(-1.0));
+    let motion_length = tangent_motion.length();
+    if motion_length <= 1e-6 || !motion_distance.is_finite() {
+        return self_position;
+    }
+
+    let lead =
+        (motion_distance / dt * CAMERA_PREDICTION_SECONDS).min(CAMERA_MAX_PREDICTION_RADIANS);
+    let motion_direction = tangent_motion.scale(1.0 / motion_length);
+    let rotation_axis = self_position.cross(motion_direction).normalize();
+    self_position.rotate_around(rotation_axis, lead).normalize()
 }
 
 fn stable_camera_up(focus: Vec3) -> Vec3 {
@@ -1391,6 +1473,11 @@ fn stable_camera_up(focus: Vec3) -> Vec3 {
     }
 }
 
+fn shared_vec3(value: Vec3) -> world_render::Vec3 {
+    world_render::Vec3::new(value.x, value.y, value.z)
+}
+
+#[allow(dead_code)]
 fn builtin_head(id: &str) -> &str {
     match id {
         "default" => "0",
@@ -1406,7 +1493,7 @@ fn builtin_head(id: &str) -> &str {
 }
 
 fn equipped_head_glyph(id: &str) -> &str {
-    builtin_head(id)
+    world_render::equipped_head_glyph(id)
 }
 
 #[derive(Debug, Clone)]
@@ -1830,6 +1917,9 @@ struct AppLayout {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct GameRenderOptions {
+    show_header: bool,
+    show_footer: bool,
+    show_pixel_inventory: bool,
     show_lobster_leaderboard: bool,
 }
 
@@ -1916,6 +2006,9 @@ fn render_app_frame(
     let layout = app_layout(width, height, panel.map(|(_, progress)| progress));
     let left_panel_visible = layout.panel.is_some() && layout.game.x > 0;
     let game_options = GameRenderOptions {
+        show_header: true,
+        show_footer: true,
+        show_pixel_inventory: true,
         show_lobster_leaderboard: width > 150 && !left_panel_visible,
     };
     let game_state = VisibleGameState {
@@ -2093,12 +2186,93 @@ fn short_method(method: &str) -> &'static str {
     }
 }
 
+#[allow(unreachable_code)]
 fn render_game_frame(
     state: &VisibleGameState,
     options: GameRenderOptions,
     selected_pixel_color: usize,
     pixel_inventory: [u64; PIXEL_COLOR_COUNT],
 ) -> FrameBuffer {
+    let shared_state = world_render::VisibleGameState {
+        width: state.width,
+        height: state.height,
+        planet_diameter_cells: state.planet_diameter_cells,
+        camera_focus: shared_vec3(state.camera_focus),
+        camera_up: shared_vec3(state.camera_up),
+        tokens_since_joining: state.tokens_since_joining,
+        tokens_all_time: state.tokens_all_time,
+        lobsters: state.lobsters,
+        lobster_yield_per_hour: state.lobster_yield_per_hour,
+        leaderboard: state
+            .leaderboard
+            .iter()
+            .map(|entry| world_render::LeaderboardEntry {
+                username: entry.username.clone(),
+                lobsters: entry.lobsters,
+                all_time_tokens: entry.all_time_tokens,
+                profile_url: entry.profile_url.clone(),
+            })
+            .collect(),
+        placed_pixels: state
+            .placed_pixels
+            .iter()
+            .map(|pixel| world_render::PlacedPixel {
+                position: pixel.position,
+                color: pixel.color,
+            })
+            .collect(),
+        pickups: state
+            .pickups
+            .iter()
+            .map(|pickup| world_render::PickupSnapshot {
+                position: pickup.position,
+                emoji: pickup.emoji.clone(),
+            })
+            .collect(),
+        players: state
+            .players
+            .iter()
+            .map(|player| world_render::VisiblePlayer {
+                name: player.name.clone(),
+                position: shared_vec3(player.position),
+                is_self: player.is_self,
+                is_fake: player.is_fake,
+                points: player.points,
+                lobsters: player.lobsters,
+                lobster_yield_per_hour: player.lobster_yield_per_hour,
+                equipped_head: player.equipped_head.clone(),
+                jump_height: player.jump_height,
+                jump_leg_pose: player.jump_leg_pose,
+                pickup_reward_lobsters: player.pickup_reward_lobsters,
+                facing: player.facing,
+                walking_phase: player.walking_phase,
+            })
+            .collect(),
+    };
+    let shared = world_render::render_game_frame(
+        &shared_state,
+        world_render::GameRenderOptions {
+            show_header: options.show_header,
+            show_footer: options.show_footer,
+            show_pixel_inventory: options.show_pixel_inventory,
+            show_lobster_leaderboard: options.show_lobster_leaderboard,
+        },
+        selected_pixel_color,
+        pixel_inventory,
+    );
+    return FrameBuffer {
+        width: shared.width,
+        height: shared.height,
+        cells: shared
+            .cells
+            .into_iter()
+            .map(|cell| Cell {
+                ch: cell.ch,
+                fg: cell.fg.map(|world_render::Color(r, g, b)| Color(r, g, b)),
+            })
+            .collect(),
+    };
+
     let width = state.width.max(1);
     let height = state.height.max(1);
     let mut frame = FrameBuffer::new(width, height);
@@ -2196,21 +2370,41 @@ fn render_game_frame(
         draw_player(&mut frame, sx, sy, player);
     }
 
-    frame.text(0, 0, "arrows move, space jumps, M market, esc exits", HUD);
-    let economy = format!(
-        "tokens consumed since joining {}  => yield {}/h  balance {}",
-        format_token_points(state.token_delta),
-        format_lobsters_per_hour(state.lobster_yield_per_hour),
-        format_lobsters(state.lobsters)
-    );
-    let economy_x = width as i32 - display_width(&economy) as i32 - 1;
-    frame.text(economy_x.max(0), 0, &economy, HUD);
+    frame.text(0, 0, HEADER_CONTROLS, HUD);
+    if let Some(economy) = economy_header(state, width as usize) {
+        let economy_x = width as i32 - display_width(&economy) as i32 - 1;
+        frame.text(economy_x.max(0), 0, &economy, HUD);
+    }
     draw_pixel_inventory(&mut frame, selected_pixel_color, pixel_inventory);
     if leaderboard_visible {
         draw_lobster_leaderboard(&mut frame, &state.leaderboard);
     }
     draw_footer(&mut frame);
     frame
+}
+
+fn economy_header(state: &VisibleGameState, width: usize) -> Option<String> {
+    let available = width
+        .saturating_sub(display_width(HEADER_CONTROLS))
+        .saturating_sub(3);
+    if available == 0 {
+        return None;
+    }
+
+    let since = format_token_points(state.tokens_since_joining);
+    let all_time = format_token_points(state.tokens_all_time);
+    let yield_rate = format_lobsters_per_hour(state.lobster_yield_per_hour);
+    let balance = format_lobsters(state.lobsters);
+    let options = [
+        format!(
+            "tokens all time {all_time}  tokens since joining {since}  => yield {yield_rate}/h  balance {balance}"
+        ),
+        format!("tokens since joining {since}  => yield {yield_rate}/h  balance {balance}"),
+        format!("{since}  => {yield_rate}/h  {balance}"),
+    ];
+    options
+        .into_iter()
+        .find(|option| display_width(option) <= available)
 }
 
 fn draw_pixel_inventory(
@@ -2308,10 +2502,14 @@ fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardE
 
     let panel_width = lobster_leaderboard_width(frame.width);
     let x = frame.width as i32 - panel_width as i32 - 1;
-    let max_entries = ((frame.height as usize).saturating_sub(4)).min(10);
+    let mut line_y = 3;
+    let max_y = frame.height as i32 - 2;
     draw_clipped_text(frame, x, 2, "🦞 leaders", panel_width, ACCENT_2);
 
-    for (index, player) in leaders.into_iter().take(max_entries).enumerate() {
+    for (index, player) in leaders.into_iter().enumerate() {
+        if line_y > max_y {
+            break;
+        }
         let line = format!(
             "{:>2}. @{:<12} {:>8} {}",
             index + 1,
@@ -2319,7 +2517,16 @@ fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardE
             format_lobsters(player.lobsters),
             player.profile_url
         );
-        draw_clipped_text(frame, x, 3 + index as i32, &line, panel_width, HUD);
+        draw_clipped_text(frame, x, line_y, &line, panel_width, HUD);
+        line_y += 1;
+        if index < 3 && line_y <= max_y {
+            let tokens = format!(
+                "    tokens all time {}",
+                format_token_points(player.all_time_tokens)
+            );
+            draw_clipped_text(frame, x, line_y, &tokens, panel_width, FG_DIM);
+            line_y += 1;
+        }
     }
 }
 
@@ -2622,9 +2829,11 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
             let points = format_token_points(player.points);
             let points_x = x - (display_width(&points) as i32 / 2);
             let points_color = if player.is_self { ACCENT_1 } else { FG_DIM };
-            frame.text(points_x, body_y - 4, &points, points_color);
+            frame.text(points_x, body_y - 3, &points, points_color);
+            frame.text(label_x, body_y - 4, &label, HUD);
+        } else {
+            frame.text(label_x, body_y - 3, &label, HUD);
         }
-        frame.text(label_x, body_y - 3, &label, HUD);
     }
 }
 
