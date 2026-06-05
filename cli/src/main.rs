@@ -314,7 +314,7 @@ async fn run_client(
                         }
                     }
                     match (&phase, key.code) {
-                        (ClientPhase::Onboarding, KeyCode::Enter) if !detected.is_empty() => {
+                        (ClientPhase::Onboarding, KeyCode::Enter) => {
                             state.ai_usage_consent = true;
                             state.enabled_ai_tools =
                                 detected.iter().map(|tool| tool.id.to_string()).collect();
@@ -1741,12 +1741,15 @@ impl UiPanel {
         if detected.is_empty() {
             blocks.push(UiBlock::Paragraph {
                 color: ACCENT_2,
-                lines: vec!["No supported local token source.".to_string()],
+                lines: vec![
+                    "No coding agent CLI was detected.".to_string(),
+                    "You can still play with 0 local tokens.".to_string(),
+                ],
             });
             return Self {
                 title: "Welcome to Ascii World".to_string(),
                 blocks,
-                prompt: Some("No supported token source was found. Press Escape.".to_string()),
+                prompt: Some(">> Press Enter to log in with X <<".to_string()),
             };
         }
 
