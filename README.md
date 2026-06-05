@@ -1,31 +1,41 @@
-# Terminal Multiplayer Game
+# Ascii World
 
-Rust backend plus Rust terminal CLI.
+The idle multiplayer game for vibe coders.
 
-## Backend
+Join from your terminal:
 
-Dev deploy:
+```sh
+curl -fsSL https://world.ascii.dev/install.sh | sh
+world
+```
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://world.ascii.dev/install.ps1 | iex"
+world
+```
+
+Ascii World turns local coding-agent token activity into points, lobster yield, cosmetics, pixels, and a shared ASCII planet. Your local usage data stays local; the CLI reports gameplay totals to the multiplayer backend.
+
+## Development
+
+Run the CLI locally:
+
+```sh
+cargo run --manifest-path cli/Cargo.toml
+```
+
+Deploy the dev backend:
 
 ```sh
 scripts/backend-dev.sh
 ```
 
-Prod deploy:
+Deploy production:
 
 ```sh
 scripts/backend-prod.sh
-```
-
-Both scripts use `BOX_API_KEY` from `.env` or `.env.production`, copy the latest backend files to a Box, run Postgres in Docker, run backend migrations, start the Rust backend detached, start `host`, and print the HTTPS URL.
-
-The dev script writes that URL to `cli/.env`. The prod script writes it to `cli/.env.production`.
-
-## CLI
-
-Run locally in dev:
-
-```sh
-cargo run --manifest-path cli/Cargo.toml
 ```
 
 Release the CLI:
@@ -34,5 +44,12 @@ Release the CLI:
 scripts/game-release-cli.sh
 ```
 
-Set the GitHub Actions variable `GAME_BACKEND_URL` to the production backend URL before cutting a release, or build locally with `cli/.env.production` present.
+## Repository
 
+- `backend/` runs the Axum websocket/API server, X login, economy, and landing page.
+- `cli/` contains the terminal client.
+- `world-render/` contains the shared ASCII planet renderer used by the CLI and landing page.
+- `assets/` contains generated world mask assets.
+- `scripts/` contains deployment, release, and local reset helpers.
+
+Runtime secrets and machine-local state belong in ignored files such as `.env`, `.env.production`, `cli/.env`, `cli/.env.production`, and `.box-state/`.
