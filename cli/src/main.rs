@@ -39,9 +39,7 @@ const CAMERA_MAX_PREDICTION_RADIANS: f64 = 0.34;
 const CAMERA_MAX_SPEED_RADIANS_PER_SECOND: f64 = 0.95;
 const CAMERA_MAX_LAG_RADIANS: f64 = 0.92;
 const CAMERA_SOFT_LAG_RADIANS: f64 = 0.58;
-const HEADER_CONTROLS: &str = "arrows move, space jumps, M market, esc exits";
-const FOOTER_TEXT: &str =
-    "Made and hosted by agents on https://box.ascii.dev, the cheapest and most powerful AI sandboxes";
+const HEADER_PROMO: &str = "post a screenshot on X and tag @asciidotdev to get 20k free 🦞";
 
 #[derive(Parser)]
 #[command(name = "Ascii World", version, about = "Multiplayer token game")]
@@ -1581,9 +1579,6 @@ enum AnsiAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Color(u8, u8, u8);
 
-const PLANET_OUTLINE: Color = Color(95, 165, 95);
-const PLANET_LAND: Color = Color(80, 145, 80);
-const PLANET_WATER: Color = Color(45, 75, 110);
 const PLAYER_SELF: Color = Color(25, 215, 255);
 const PLAYER_NPC: Color = Color(255, 190, 125);
 const PLAYER_OTHER: Color = Color(245, 245, 245);
@@ -2103,7 +2098,16 @@ fn render_app_frame(
     if let (Some(rect), Some((panel, _))) = (layout.panel, panel) {
         render_panel(&mut frame, rect, panel);
     }
+    draw_header_promo(&mut frame);
     frame
+}
+
+fn draw_header_promo(frame: &mut FrameBuffer) {
+    if frame.height < 2 {
+        return;
+    }
+    let promo_x = frame.width as i32 - display_width(HEADER_PROMO) as i32 - 1;
+    frame.text(promo_x.max(0), 1, HEADER_PROMO, HUD);
 }
 
 fn render_panel(frame: &mut FrameBuffer, rect: Rect, panel: &UiPanel) {
@@ -2262,7 +2266,6 @@ fn short_method(method: &str) -> &'static str {
     }
 }
 
-#[allow(unreachable_code)]
 fn render_game_frame(
     state: &VisibleGameState,
     options: GameRenderOptions,
@@ -2336,7 +2339,7 @@ fn render_game_frame(
         selected_pixel_color,
         pixel_inventory,
     );
-    return FrameBuffer {
+    FrameBuffer {
         width: shared.width,
         height: shared.height,
         cells: shared
@@ -2347,197 +2350,12 @@ fn render_game_frame(
                 fg: cell.fg.map(|world_render::Color(r, g, b)| Color(r, g, b)),
             })
             .collect(),
-    };
-
-    let width = state.width.max(1);
-    let height = state.height.max(1);
-    let mut frame = FrameBuffer::new(width, height);
-    draw_starfield(&mut frame);
-    let leaderboard_visible =
-        options.show_lobster_leaderboard && should_render_lobster_leaderboard(width, height);
-    let leaderboard_width = lobster_leaderboard_width(width);
-    let cx = if leaderboard_visible {
-        width as f64 / 2.0 - leaderboard_width as f64 * 0.28
-    } else {
-        width as f64 / 2.0
-    };
-    let cy = height as f64 / 2.0;
-    let radius_x = (state.planet_diameter_cells / 2.0).min((width as f64 - 4.0).max(4.0) / 2.0);
-    let radius_y = (radius_x / 2.0).min((height as f64 - 6.0).max(3.0) / 2.0);
-    let view_normal = state.camera_focus.normalize();
-    let up = state
-        .camera_up
-        .add(view_normal.scale(-state.camera_up.dot(view_normal)))
-        .normalize();
-    let right = up.cross(view_normal).normalize();
-
-    for y in 0..height {
-        for x in 0..width {
-            let nx = (x as f64 + 0.5 - cx) / radius_x;
-            let ny = (y as f64 + 0.5 - cy) / radius_y;
-            let d = nx * nx + ny * ny;
-            if d < 0.88 {
-                frame.put_cell(x as i32, y as i32, Cell::default());
-                let py = -ny;
-                let depth = (1.0 - nx * nx - py * py).max(0.0).sqrt();
-                let world = right
-                    .scale(nx)
-                    .add(up.scale(py))
-                    .add(view_normal.scale(depth))
-                    .normalize();
-                if earth_land(world) {
-                    frame.put(x as i32, y as i32, land_char(world), PLANET_LAND);
-                } else if ((x as u32 + y as u32) % 5) == 0 {
-                    frame.put(x as i32, y as i32, '.', PLANET_WATER);
-                }
-            }
-            if (0.88..=1.08).contains(&d) {
-                frame.put(x as i32, y as i32, '.', PLANET_OUTLINE);
-            }
-        }
     }
-
-    for pixel in &state.placed_pixels {
-        if pixel.color >= PIXEL_COLOR_COUNT {
-            continue;
-        }
-        let Some(position) = Vec3::from_array(pixel.position) else {
-            continue;
-        };
-        if position.dot(view_normal) <= 0.0 {
-            continue;
-        }
-        let px = position.dot(right);
-        let py = position.dot(up);
-        let sx = (cx + px * radius_x).round() as i32;
-        let sy = (cy - py * radius_y).round() as i32;
-        draw_pixel_block(&mut frame, sx, sy, PIXEL_COLORS[pixel.color]);
-    }
-
-    for pickup in &state.pickups {
-        let Some(position) = Vec3::from_array(pickup.position) else {
-            continue;
-        };
-        if position.dot(view_normal) <= 0.0 {
-            continue;
-        }
-        let px = position.dot(right);
-        let py = position.dot(up);
-        let sx = (cx + px * radius_x).round() as i32;
-        let sy = (cy - py * radius_y).round() as i32;
-        frame.text(sx, sy, &pickup.emoji, ACCENT_2);
-    }
-
-    let mut players = state.players.clone();
-    players.sort_by(|a, b| {
-        a.position
-            .dot(view_normal)
-            .partial_cmp(&b.position.dot(view_normal))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    for player in &players {
-        if player.position.dot(view_normal) <= 0.0 {
-            continue;
-        }
-        let px = player.position.dot(right);
-        let py = player.position.dot(up);
-        let sx = (cx + px * radius_x).round() as i32;
-        let sy = (cy - py * radius_y).round() as i32;
-        draw_player(&mut frame, sx, sy, player);
-    }
-
-    frame.text(0, 0, HEADER_CONTROLS, HUD);
-    if let Some(economy) = economy_header(state, width as usize) {
-        let economy_x = width as i32 - display_width(&economy) as i32 - 1;
-        frame.text(economy_x.max(0), 0, &economy, HUD);
-    }
-    draw_pixel_inventory(&mut frame, selected_pixel_color, pixel_inventory);
-    if leaderboard_visible {
-        draw_lobster_leaderboard(&mut frame, &state.leaderboard);
-    }
-    draw_footer(&mut frame);
-    frame
-}
-
-fn economy_header(state: &VisibleGameState, width: usize) -> Option<String> {
-    let available = width
-        .saturating_sub(display_width(HEADER_CONTROLS))
-        .saturating_sub(3);
-    if available == 0 {
-        return None;
-    }
-
-    let since = format_token_points(state.tokens_since_joining);
-    let all_time = format_token_points(state.tokens_all_time);
-    let yield_rate = format_lobsters_per_hour(state.lobster_yield_per_hour);
-    let balance = format_lobsters(state.lobsters);
-    let options = [
-        format!(
-            "tokens all time {all_time}  tokens since joining {since}  => yield {yield_rate}/h  balance {balance}"
-        ),
-        format!("tokens since joining {since}  => yield {yield_rate}/h  balance {balance}"),
-        format!("{since}  => {yield_rate}/h  {balance}"),
-    ];
-    options
-        .into_iter()
-        .find(|option| display_width(option) <= available)
-}
-
-fn draw_pixel_inventory(
-    frame: &mut FrameBuffer,
-    selected_color: usize,
-    inventory: [u64; PIXEL_COLOR_COUNT],
-) {
-    if frame.height < 3 || !inventory.iter().any(|count| *count > 0) {
-        return;
-    }
-    let y = frame.height as i32 - 2;
-    let mut x = 0;
-    frame.text(x, y, "pixels ", HUD);
-    x += 7;
-    for color in 0..PIXEL_COLOR_COUNT {
-        let count = inventory[color];
-        if count == 0 {
-            continue;
-        }
-        let shortcut = color + 1;
-        let label = if color == selected_color {
-            format!("[{shortcut}:{}]", format_count(count))
-        } else {
-            format!("{shortcut}:{}", format_count(count))
-        };
-        draw_pixel_block(frame, x, y, PIXEL_COLORS[color]);
-        x += 3;
-        frame.text(x, y, &label, HUD);
-        x += display_width(&label) as i32 + 1;
-    }
-    frame.text(x, y, "P place", HUD);
 }
 
 fn draw_pixel_block(frame: &mut FrameBuffer, x: i32, y: i32, color: Color) {
     frame.put(x, y, '█', color);
     frame.put(x + 1, y, '█', color);
-}
-
-fn draw_footer(frame: &mut FrameBuffer) {
-    if frame.height == 0 {
-        return;
-    }
-    let width = frame.width as usize;
-    let text_width = display_width(FOOTER_TEXT);
-    let x = if text_width >= width {
-        0
-    } else {
-        ((width - text_width) / 2) as i32
-    };
-    draw_clipped_text(
-        frame,
-        x,
-        frame.height as i32 - 1,
-        FOOTER_TEXT,
-        width.saturating_sub(x.max(0) as usize),
-        HUD,
-    );
 }
 
 fn display_width(text: &str) -> usize {
