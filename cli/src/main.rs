@@ -237,6 +237,7 @@ async fn run_client(
     let mut tokens_all_time = ai_usage::UsageSnapshot::default();
     let mut last_reported_tokens: Option<u64> = None;
     let mut last_token_report = Instant::now() - Duration::from_secs(5);
+    let mut next_reconnect_attempt = Instant::now();
     let mut reward_dialog_closed = false;
     let mut reward_dialog_opened_at: Option<Instant> = None;
     let mut market_open = false;
@@ -503,6 +504,45 @@ async fn run_client(
             }
         }
 
+        if matches!(phase, ClientPhase::Playing) {
+            let disconnected = active_state
+                .lock()
+                .map(|state| state.disconnected_at.is_some())
+                .unwrap_or(true);
+            if disconnected && Instant::now() >= next_reconnect_attempt {
+                next_reconnect_attempt = Instant::now() + Duration::from_secs(2);
+                if let Some(token) = state.game_api_token.as_deref() {
+                    match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        start_player_connection(&backend_url, token),
+                    )
+                    .await
+                    {
+                        Ok(Ok((joined_state, tx))) => {
+                            active_state = joined_state;
+                            player_tx = Some(tx);
+                            last_sent = InputState::default();
+                            renderer.reset();
+                        }
+                        Ok(Err(error)) if is_auth_rejected(&error) => {
+                            state.game_api_token = None;
+                            state.x_username = None;
+                            state.x_name = None;
+                            state.onboarding_completed = false;
+                            save_state(&state_path, &state)?;
+                            if let Some(spectator_state) = start_spectator(&backend_url).await {
+                                active_state = spectator_state;
+                            }
+                            player_tx = None;
+                            phase = ClientPhase::Onboarding;
+                            renderer.reset();
+                        }
+                        Ok(Err(_)) | Err(_) => {}
+                    }
+                }
+            }
+        }
+
         if last_frame.elapsed() >= Duration::from_micros(16_667) {
             let frame_started = Instant::now();
             let frame_dt = frame_started
@@ -627,6 +667,7 @@ async fn start_spectator(backend_url: &str) -> Option<Arc<Mutex<ClientGameState>
                 Ok(ServerMessage::Snapshot(snapshot)) => {
                     let result = validate_snapshot(&snapshot);
                     if let Ok(mut state) = reader_state.lock() {
+                        state.disconnected_at = None;
                         match result {
                             Ok(()) => {
                                 state.snapshot = Some(snapshot);
@@ -638,16 +679,21 @@ async fn start_spectator(backend_url: &str) -> Option<Arc<Mutex<ClientGameState>
                 }
                 Ok(ServerMessage::Welcome { .. }) => {
                     if let Ok(mut state) = reader_state.lock() {
+                        state.disconnected_at = None;
                         state.protocol_error =
                             Some("backend sent welcome message on spectator websocket".to_string());
                     }
                 }
                 Err(err) => {
                     if let Ok(mut state) = reader_state.lock() {
+                        state.disconnected_at = None;
                         state.protocol_error = Some(format!("backend protocol error: {err}"));
                     }
                 }
             }
+        }
+        if let Ok(mut state) = reader_state.lock() {
+            state.disconnected_at = Some(Instant::now());
         }
     });
     Some(shared)
@@ -680,6 +726,7 @@ async fn start_player_connection(
                     market,
                 }) => {
                     if let Ok(mut state) = reader_state.lock() {
+                        state.disconnected_at = None;
                         state.self_id = Some(self_id);
                         state.rewards = rewards;
                         state.market = market;
@@ -688,6 +735,7 @@ async fn start_player_connection(
                 Ok(ServerMessage::Snapshot(snapshot)) => {
                     let result = validate_snapshot(&snapshot);
                     if let Ok(mut state) = reader_state.lock() {
+                        state.disconnected_at = None;
                         match result {
                             Ok(()) => state.snapshot = Some(snapshot),
                             Err(err) => state.protocol_error = Some(err.to_string()),
@@ -696,20 +744,28 @@ async fn start_player_connection(
                 }
                 Err(err) => {
                     if let Ok(mut state) = reader_state.lock() {
+                        state.disconnected_at = None;
                         state.protocol_error = Some(format!("backend protocol error: {err}"));
                     }
                 }
             }
         }
+        if let Ok(mut state) = reader_state.lock() {
+            state.disconnected_at = Some(Instant::now());
+        }
     });
 
     let (tx, mut rx) = tokio_mpsc::unbounded_channel::<ClientMessage>();
+    let writer_state = shared.clone();
     tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             let Ok(text) = serde_json::to_string(&message) else {
                 continue;
             };
             if ws_tx.send(Message::Text(text.into())).await.is_err() {
+                if let Ok(mut state) = writer_state.lock() {
+                    state.disconnected_at = Some(Instant::now());
+                }
                 break;
             }
         }
@@ -1035,6 +1091,7 @@ struct ClientGameState {
     rewards: Vec<RewardNotice>,
     market: Vec<MarketItem>,
     protocol_error: Option<String>,
+    disconnected_at: Option<Instant>,
 }
 
 impl ClientGameState {
