@@ -11,6 +11,7 @@ mod land_mask;
 pub const PIXEL_COLOR_COUNT: usize = 5;
 const JUMP_GROUND_EPSILON: f64 = 0.02;
 const HEADER_CONTROLS: &str = "arrows move, space jumps, M market, esc exits";
+const HEADER_PROMO: &str = "post a screenshot on X and tag @asciidotdev to get 20k free \u{1f99e}";
 const FOOTER_TEXT: &str =
     "Made and hosted by agents on https://box.ascii.dev, the cheapest and most powerful AI sandboxes";
 const WIDE_CONTINUATION: char = '\0';
@@ -433,6 +434,8 @@ pub fn render_game_frame(
             let economy_x = width as i32 - display_width(&economy) as i32 - 1;
             frame.text(economy_x.max(0), 0, &economy, HUD);
         }
+        let promo_x = width as i32 - display_width(HEADER_PROMO) as i32 - 1;
+        frame.text(promo_x.max(0), 1, HEADER_PROMO, ACCENT_2);
     }
     if options.show_pixel_inventory {
         draw_pixel_inventory(&mut frame, selected_pixel_color, pixel_inventory);
