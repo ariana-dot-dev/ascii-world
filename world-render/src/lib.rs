@@ -899,27 +899,32 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
     }
     let body_y = y - lift;
     if player.combat_mode {
+        let head = if player.equipped_head.trim().is_empty() {
+            "0".to_string()
+        } else {
+            player.equipped_head.clone()
+        };
         let rows = if player.punching && facing_right {
             [
-                (0, x, "0".to_string()),
+                (0, x, head.clone()),
                 (1, x, "L/->".to_string()),
                 (1, x, "/ |".to_string()),
             ]
         } else if player.punching {
             [
-                (0, x, "0".to_string()),
+                (0, x, head.clone()),
                 (1, x - 3, "<-\\J".to_string()),
                 (2, x - 1, "| \\".to_string()),
             ]
         } else if facing_right {
             [
-                (0, x, "0".to_string()),
+                (0, x, head.clone()),
                 (1, x - 1, "L/L".to_string()),
                 (2, x - 1, "/ \\".to_string()),
             ]
         } else {
             [
-                (0, x, "0".to_string()),
+                (0, x, head),
                 (1, x - 1, "J\\J".to_string()),
                 (2, x - 1, "/ \\".to_string()),
             ]

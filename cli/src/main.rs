@@ -946,10 +946,22 @@ async fn try_self_update() {
     {
         #[cfg(unix)]
         {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(0o755));
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(0o755));
         }
-        let _ = fs::rename(temp, current_exe);
+        if fs::rename(&temp, &current_exe).is_ok() {
+            let args: Vec<_> = env::args_os().skip(1).collect();
+            if Command::new(&current_exe)
+                .args(args)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .is_ok()
+            {
+                process::exit(0);
+            }
+        }
     }
 }
 
