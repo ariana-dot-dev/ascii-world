@@ -176,6 +176,10 @@ pub struct VisiblePlayer {
     pub pickup_reward_lobsters: u64,
     pub facing: i8,
     pub walking_phase: u64,
+    pub combat_mode: bool,
+    pub punching: bool,
+    pub invulnerable: bool,
+    pub blink_visible: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +230,7 @@ const PLANET_WATER: Color = Color(45, 75, 110);
 const PLAYER_SELF: Color = Color(25, 215, 255);
 const PLAYER_NPC: Color = Color(255, 190, 125);
 const PLAYER_OTHER: Color = Color(245, 245, 245);
+const COMBAT_RED: Color = Color(255, 70, 70);
 const HUD: Color = Color(120, 120, 120);
 const STAR_DIM: Color = Color(70, 76, 92);
 const STAR_MID: Color = Color(105, 114, 135);
@@ -849,13 +854,16 @@ fn land_char(position: Vec3) -> char {
 }
 
 fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) {
-    let color = if player.is_self {
+    let mut color = if player.is_self {
         PLAYER_SELF
     } else if player.is_fake {
         PLAYER_NPC
     } else {
         PLAYER_OTHER
     };
+    if player.invulnerable && !player.blink_visible {
+        color = Color(color.0 / 3, color.1 / 3, color.2 / 3);
+    }
     let facing_right = player.facing > 0;
     let is_airborne = player.jump_height > JUMP_GROUND_EPSILON;
     let legs = if is_airborne {
@@ -890,27 +898,58 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
         frame.text(x - 1, y, shadow, FG_V_DIM);
     }
     let body_y = y - lift;
-    let head = if player.equipped_head.trim().is_empty() {
-        "0"
+    if player.combat_mode {
+        let rows = if player.punching && facing_right {
+            [
+                (0, x, "0".to_string()),
+                (1, x, "L/->".to_string()),
+                (1, x, "/ |".to_string()),
+            ]
+        } else if player.punching {
+            [
+                (0, x, "0".to_string()),
+                (1, x - 3, "<-\\J".to_string()),
+                (2, x - 1, "| \\".to_string()),
+            ]
+        } else if facing_right {
+            [
+                (0, x, "0".to_string()),
+                (1, x - 1, "L/L".to_string()),
+                (2, x - 1, "/ \\".to_string()),
+            ]
+        } else {
+            [
+                (0, x, "0".to_string()),
+                (1, x - 1, "J\\J".to_string()),
+                (2, x - 1, "/ \\".to_string()),
+            ]
+        };
+        for (dy, row_x, text) in rows {
+            frame.text(row_x, body_y - 2 + dy, &text, color);
+        }
     } else {
-        player.equipped_head.as_str()
-    };
-    let head_row = if head.is_ascii() {
-        format!(" {head} ")
-    } else {
-        format!("{head} ")
-    };
-    let head_shift = facing_right && head != "0";
-    let head_x = if head.is_ascii() { x - 1 } else { x } - i32::from(head_shift);
-    let chest = if facing_right { "-]-" } else { "-[-" };
-    let legs_x = if facing_right { x - 2 } else { x - 1 };
-    let rows = [
-        (0, head_x, head_row),
-        (1, x - 1, chest.to_string()),
-        (2, legs_x, format!(" {legs}")),
-    ];
-    for (dy, row_x, text) in rows {
-        frame.text(row_x, body_y - 2 + dy, &text, color);
+        let head = if player.equipped_head.trim().is_empty() {
+            "0"
+        } else {
+            player.equipped_head.as_str()
+        };
+        let head_row = if head.is_ascii() {
+            format!(" {head} ")
+        } else {
+            format!("{head} ")
+        };
+        let head_shift = facing_right && head != "0";
+        let head_x = if head.is_ascii() { x - 1 } else { x } - i32::from(head_shift);
+        let chest = if facing_right { "-]-" } else { "-[-" };
+        let legs_x = if facing_right { x - 2 } else { x - 1 };
+        let rows = [
+            (0, head_x, head_row),
+            (1, x - 1, chest.to_string()),
+            (2, legs_x, format!(" {legs}")),
+        ];
+        for (dy, row_x, text) in rows {
+            frame.text(row_x, body_y - 2 + dy, &text, color);
+        }
     }
     if !player.name.is_empty() {
         let label = format!("@{}", player.name);
@@ -929,8 +968,14 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
                 Color(190, 190, 190)
             };
             frame.text(points_x, body_y - 3, &points, points_color);
+            if player.combat_mode {
+                frame.text(label_x - 2, body_y - 4, "C", COMBAT_RED);
+            }
             frame.text(label_x, body_y - 4, &label, HUD);
         } else {
+            if player.combat_mode {
+                frame.text(label_x - 2, body_y - 3, "C", COMBAT_RED);
+            }
             frame.text(label_x, body_y - 3, &label, HUD);
         }
     }

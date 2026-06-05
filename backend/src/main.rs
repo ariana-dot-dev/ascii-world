@@ -149,6 +149,9 @@ struct Player {
     owned_pixels: [u64; PIXEL_COLOR_COUNT],
     facing: i8,
     walking_phase: u64,
+    combat_mode: bool,
+    punching_until: Option<Instant>,
+    invulnerable_until: Option<Instant>,
     npc_movement: Option<NpcMovement>,
 }
 
@@ -287,6 +290,8 @@ enum ClientMessage {
     PlacePixel {
         color: usize,
     },
+    ToggleCombat,
+    Punch,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,6 +349,10 @@ struct PlayerSnapshot {
     jump_leg_pose: i8,
     facing: i8,
     walking_phase: u64,
+    combat_mode: bool,
+    punching: bool,
+    invulnerable: bool,
+    blink_visible: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1803,6 +1812,10 @@ fn render_spectator_frame_html(snapshot: &Snapshot, width: u16, height: u16) -> 
                     .unwrap_or(0),
                 facing: player.facing,
                 walking_phase: player.walking_phase,
+                combat_mode: player.combat_mode,
+                punching: player.punching,
+                invulnerable: player.invulnerable,
+                blink_visible: player.blink_visible,
             })
         })
         .collect();
@@ -1975,6 +1988,12 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
                                         error!("failed to persist pixel placement: {err}");
                                     }
                                 }
+                            }
+                            Ok(ClientMessage::ToggleCombat) => {
+                                state.game.toggle_combat(&player_id).await;
+                            }
+                            Ok(ClientMessage::Punch) => {
+                                state.game.punch(&player_id).await;
                             }
                             Err(err) => error!("bad client message: {err}"),
                         }
@@ -2344,6 +2363,9 @@ impl Game {
                 owned_pixels,
                 facing,
                 walking_phase,
+                combat_mode: false,
+                punching_until: None,
+                invulnerable_until: None,
                 npc_movement: None,
             },
         );
@@ -2397,6 +2419,20 @@ impl Game {
                 start_player_jump(player, input);
             }
         }
+    }
+
+    async fn toggle_combat(&self, id: &str) {
+        let mut world = self.world.lock().await;
+        if let Some(player) = world.players.get_mut(id) {
+            player.last_seen = Instant::now();
+            player.combat_mode = !player.combat_mode;
+            player.punching_until = None;
+        }
+    }
+
+    async fn punch(&self, id: &str) {
+        let mut world = self.world.lock().await;
+        resolve_punch(&mut world, id, Instant::now());
     }
 
     async fn set_token_totals(
@@ -2614,6 +2650,10 @@ const JUMP_GRAVITY_CELLS_PER_SECOND2: f64 = 19.0;
 const MAX_JUMP_HEIGHT_CELLS: f64 = 2.0;
 const JUMP_GROUND_EPSILON: f64 = 0.02;
 const THIRD_MOMENTUM_JUMP_MULTIPLIER: f64 = 6.0;
+const PUNCH_ANIMATION_MS: u64 = 260;
+const PUNCH_INVULNERABLE_MS: u64 = 3_000;
+const PUNCH_REACH_RADIANS: f64 = 0.115;
+const PUNCH_LATERAL_RADIANS: f64 = 0.055;
 const NPC_NAMES: &[&str] = &[
     "Coco", "Lulu", "Rico", "Fifi", "Toto", "Mimi", "Pepe", "Gigi", "Bibi", "Nono", "Kiki", "Zaza",
     "Didi", "Paco", "Lola", "Nico", "Tina", "Jojo", "Pipo", "Nina", "Chico", "Mona", "Roxy",
@@ -2740,6 +2780,9 @@ fn spawn_npc(world: &mut GameWorld, rng: &mut impl Rng) {
             owned_pixels: [0; PIXEL_COLOR_COUNT],
             facing: 0,
             walking_phase: 0,
+            combat_mode: false,
+            punching_until: None,
+            invulnerable_until: None,
             npc_movement: Some(NpcMovement::Idle {
                 remaining_seconds: random_npc_idle_seconds(rng),
             }),
@@ -2841,6 +2884,72 @@ fn jump_leg_pose_from_momentum(player: &Player) -> i8 {
     }
 }
 
+fn resolve_punch(world: &mut GameWorld, attacker_id: &str, now: Instant) {
+    let Some(attacker) = world.players.get_mut(attacker_id) else {
+        return;
+    };
+    attacker.last_seen = now;
+    if !attacker.combat_mode {
+        return;
+    }
+    attacker.punching_until = Some(now + Duration::from_millis(PUNCH_ANIMATION_MS));
+
+    let attacker_position = attacker.position;
+    let attacker_right = screen_right_for_player(attacker);
+    let facing = if attacker.facing < 0 { -1.0 } else { 1.0 };
+    let attack_direction = attacker_right.scale(facing).normalize();
+
+    let target_id = world
+        .players
+        .iter()
+        .filter(|(id, player)| id.as_str() != attacker_id && player.combat_mode)
+        .filter(|(_, player)| {
+            player
+                .invulnerable_until
+                .map(|until| until <= now)
+                .unwrap_or(true)
+        })
+        .filter_map(|(id, player)| {
+            let tangent_delta = player
+                .position
+                .add(attacker_position.scale(-player.position.dot(attacker_position)));
+            let distance = tangent_delta.length();
+            if distance <= 1e-6 || distance > PUNCH_REACH_RADIANS {
+                return None;
+            }
+            let direction = tangent_delta.normalize();
+            let forward = direction.dot(attack_direction);
+            let lateral = (distance * (1.0 - forward * forward).max(0.0).sqrt()).abs();
+            if forward > 0.2 && lateral <= PUNCH_LATERAL_RADIANS {
+                Some((id.clone(), distance))
+            } else {
+                None
+            }
+        })
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(id, _)| id);
+
+    if let Some(target_id) = target_id {
+        if let Some(target) = world.players.get_mut(&target_id) {
+            let knockback = attack_direction
+                .add(
+                    target
+                        .position
+                        .scale(-attack_direction.dot(target.position)),
+                )
+                .normalize();
+            target.jump_height = target.jump_height.max(JUMP_GROUND_EPSILON);
+            target.jump_velocity = JUMP_IMPULSE_CELLS_PER_SECOND;
+            target.jump_momentum = Some(knockback);
+            target.last_jump_momentum = Some(knockback);
+            target.momentum_jump_chain = 3;
+            target.jump_momentum_multiplier = THIRD_MOMENTUM_JUMP_MULTIPLIER;
+            target.jump_leg_pose = jump_leg_pose_from_momentum(target);
+            target.invulnerable_until = Some(now + Duration::from_millis(PUNCH_INVULNERABLE_MS));
+        }
+    }
+}
+
 fn screen_up_for_player(player: &Player) -> Vec3 {
     let camera_up = player
         .input
@@ -2867,6 +2976,20 @@ fn tick_world(world: &mut GameWorld, dt: f64) -> Vec<EconomySave> {
     let mut saves = Vec::new();
     let economy_now = Instant::now();
     for player in world.players.values_mut().filter(|player| !player.fake) {
+        if player
+            .punching_until
+            .map(|until| until <= economy_now)
+            .unwrap_or(false)
+        {
+            player.punching_until = None;
+        }
+        if player
+            .invulnerable_until
+            .map(|until| until <= economy_now)
+            .unwrap_or(false)
+        {
+            player.invulnerable_until = None;
+        }
         accrue_lobsters(player, economy_now);
         tick_jump(player, dt);
         let screen_up = screen_up_for_player(player);
@@ -3194,11 +3317,25 @@ fn update_facing_from_movement(
 }
 
 fn snapshot_world(world: &GameWorld, leaderboard: Vec<LeaderboardEntry>) -> Snapshot {
+    let now = Instant::now();
     let players = world
         .players
         .values()
         .map(|player| {
             let (lat, lon) = player.position.lat_lon();
+            let punching = player
+                .punching_until
+                .map(|until| until > now)
+                .unwrap_or(false);
+            let invulnerable = player
+                .invulnerable_until
+                .map(|until| until > now)
+                .unwrap_or(false);
+            let blink_visible = player
+                .invulnerable_until
+                .and_then(|until| until.checked_duration_since(now))
+                .map(|remaining| (remaining.as_millis() / 150) % 2 == 0)
+                .unwrap_or(true);
             PlayerSnapshot {
                 id: player.id.clone(),
                 name: player.name.clone(),
@@ -3218,6 +3355,10 @@ fn snapshot_world(world: &GameWorld, leaderboard: Vec<LeaderboardEntry>) -> Snap
                 jump_leg_pose: player.jump_leg_pose,
                 facing: player.facing,
                 walking_phase: player.walking_phase,
+                combat_mode: player.combat_mode,
+                punching,
+                invulnerable,
+                blink_visible,
             }
         })
         .collect();
@@ -3378,6 +3519,44 @@ impl IntoResponse for AppError {
 mod tests {
     use super::*;
 
+    fn test_player(id: &str, position: Vec3) -> Player {
+        Player {
+            id: id.to_string(),
+            user_id: None,
+            last_seen: Instant::now(),
+            name: id.to_string(),
+            planet_id: 0,
+            position,
+            basis_up: Vec3::Z
+                .add(position.scale(-Vec3::Z.dot(position)))
+                .normalize(),
+            input: InputState::default(),
+            fake: false,
+            jump_height: 0.0,
+            jump_velocity: 0.0,
+            jump_momentum: None,
+            last_jump_started_at: None,
+            last_jump_momentum: None,
+            jump_leg_pose: 0,
+            momentum_jump_chain: 0,
+            jump_momentum_multiplier: 1.0,
+            npc_jump_seconds: 0.0,
+            total_tokens: 0,
+            all_time_tokens: 0,
+            lobster_micros: 0,
+            last_economy_at: Instant::now(),
+            equipped_head: "default".to_string(),
+            owned_heads: vec!["default".to_string()],
+            owned_pixels: [0; PIXEL_COLOR_COUNT],
+            facing: 0,
+            walking_phase: 0,
+            combat_mode: false,
+            punching_until: None,
+            invulnerable_until: None,
+            npc_movement: None,
+        }
+    }
+
     #[test]
     fn lobster_income_uses_current_market_rate() {
         assert_eq!(LOBSTER_RATE_TOKEN_UNIT, 6_000_000);
@@ -3413,6 +3592,9 @@ mod tests {
             owned_pixels: [0; PIXEL_COLOR_COUNT],
             facing: 0,
             walking_phase: 0,
+            combat_mode: false,
+            punching_until: None,
+            invulnerable_until: None,
             npc_movement: None,
         };
 
@@ -3462,6 +3644,9 @@ mod tests {
                     owned_pixels: [0; PIXEL_COLOR_COUNT],
                     facing: 0,
                     walking_phase: 0,
+                    combat_mode: false,
+                    punching_until: None,
+                    invulnerable_until: None,
                     npc_movement: None,
                 },
             )]),
@@ -3626,6 +3811,9 @@ mod tests {
             owned_pixels: [0; PIXEL_COLOR_COUNT],
             facing: 0,
             walking_phase: 0,
+            combat_mode: false,
+            punching_until: None,
+            invulnerable_until: None,
             npc_movement: None,
         };
 
@@ -3661,6 +3849,52 @@ mod tests {
     }
 
     #[test]
+    fn combat_punch_knocks_back_nearby_combat_player_once() {
+        let now = Instant::now();
+        let attacker_position = Vec3::new(1.0, 0.0, 0.0);
+        let target_position = attacker_position
+            .rotate_around(Vec3::Z, PUNCH_REACH_RADIANS * 0.5)
+            .normalize();
+        let mut attacker = test_player("attacker", attacker_position);
+        attacker.combat_mode = true;
+        attacker.facing = 1;
+        attacker.basis_up = Vec3::Z;
+        let mut target = test_player("target", target_position);
+        target.combat_mode = true;
+        let mut world = GameWorld {
+            players: HashMap::from([
+                ("attacker".to_string(), attacker),
+                ("target".to_string(), target),
+            ]),
+            placed_pixels: HashMap::new(),
+            pickups: HashMap::new(),
+            pickup_rewards: Vec::new(),
+            next_pickup_id: 0,
+            last_pickup_spawn: now,
+            next_npc_id: 0,
+            last_tick: now,
+        };
+
+        resolve_punch(&mut world, "attacker", now);
+
+        let target = world.players.get("target").unwrap();
+        assert_eq!(target.jump_velocity, JUMP_IMPULSE_CELLS_PER_SECOND);
+        assert_eq!(
+            target.jump_momentum_multiplier,
+            THIRD_MOMENTUM_JUMP_MULTIPLIER
+        );
+        assert!(target.invulnerable_until.unwrap() > now);
+        let first_invulnerable_until = target.invulnerable_until;
+
+        resolve_punch(&mut world, "attacker", now + Duration::from_millis(100));
+
+        assert_eq!(
+            world.players.get("target").unwrap().invulnerable_until,
+            first_invulnerable_until
+        );
+    }
+
+    #[test]
     fn third_chained_momentum_jump_uses_fast_multiplier() {
         let position = Vec3::new(1.0, 0.0, 0.0);
         let mut player = Player {
@@ -3691,6 +3925,9 @@ mod tests {
             owned_pixels: [0; PIXEL_COLOR_COUNT],
             facing: 0,
             walking_phase: 0,
+            combat_mode: false,
+            punching_until: None,
+            invulnerable_until: None,
             npc_movement: None,
         };
         let momentum = Vec3::new(0.0, 1.0, 0.0);
@@ -3786,6 +4023,9 @@ mod tests {
                     owned_pixels: [0; PIXEL_COLOR_COUNT],
                     facing: 0,
                     walking_phase: 0,
+                    combat_mode: false,
+                    punching_until: None,
+                    invulnerable_until: None,
                     npc_movement: Some(NpcMovement::Idle {
                         remaining_seconds: 0.0,
                     }),

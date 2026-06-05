@@ -8,7 +8,7 @@ use std::{
         mpsc as std_mpsc, Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context};
@@ -26,11 +26,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
-mod land_mask;
-
 const ONBOARDING_VERSION: u32 = 3;
 const PIXEL_COLOR_COUNT: usize = 5;
-const JUMP_GROUND_EPSILON: f64 = 0.02;
 const CAMERA_FOLLOW_STIFFNESS: f64 = 3.6;
 const CAMERA_CENTERING_STIFFNESS: f64 = 0.55;
 const CAMERA_FOLLOW_DAMPING: f64 = 5.4;
@@ -365,6 +362,16 @@ async fn run_client(
                                 let _ = tx.send(ClientMessage::PlacePixel {
                                     color: selected_pixel_color,
                                 });
+                            }
+                        }
+                        (ClientPhase::Playing, KeyCode::Char('c') | KeyCode::Char('C')) => {
+                            if let Some(tx) = &player_tx {
+                                let _ = tx.send(ClientMessage::ToggleCombat);
+                            }
+                        }
+                        (ClientPhase::Playing, KeyCode::Char('q') | KeyCode::Char('Q')) => {
+                            if let Some(tx) = &player_tx {
+                                let _ = tx.send(ClientMessage::Punch);
                             }
                         }
                         (ClientPhase::Playing, KeyCode::Up) => {
@@ -978,6 +985,8 @@ enum ClientMessage {
     PlacePixel {
         color: usize,
     },
+    ToggleCombat,
+    Punch,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1055,6 +1064,18 @@ struct PlayerSnapshot {
     #[serde(default)]
     facing: i8,
     walking_phase: u64,
+    #[serde(default)]
+    combat_mode: bool,
+    #[serde(default)]
+    punching: bool,
+    #[serde(default)]
+    invulnerable: bool,
+    #[serde(default = "default_blink_visible")]
+    blink_visible: bool,
+}
+
+fn default_blink_visible() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1311,6 +1332,10 @@ struct VisiblePlayer {
     pickup_reward_lobsters: u64,
     facing: i8,
     walking_phase: u64,
+    combat_mode: bool,
+    punching: bool,
+    invulnerable: bool,
+    blink_visible: bool,
 }
 
 impl VisibleGameState {
@@ -1386,6 +1411,10 @@ impl VisibleGameState {
                         .sum(),
                     facing: player.facing,
                     walking_phase: player.walking_phase,
+                    combat_mode: player.combat_mode,
+                    punching: player.punching,
+                    invulnerable: player.invulnerable,
+                    blink_visible: player.blink_visible,
                 }
             })
             .collect();
@@ -1579,13 +1608,7 @@ enum AnsiAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Color(u8, u8, u8);
 
-const PLAYER_SELF: Color = Color(25, 215, 255);
-const PLAYER_NPC: Color = Color(255, 190, 125);
-const PLAYER_OTHER: Color = Color(245, 245, 245);
 const HUD: Color = Color(120, 120, 120);
-const STAR_DIM: Color = Color(70, 76, 92);
-const STAR_MID: Color = Color(105, 114, 135);
-const STAR_BRIGHT: Color = Color(155, 166, 190);
 const FG: Color = Color(245, 245, 245);
 const FG_DIM: Color = Color(190, 190, 190);
 const FG_V_DIM: Color = Color(120, 120, 120);
@@ -2357,6 +2380,10 @@ fn render_game_frame(
                 pickup_reward_lobsters: player.pickup_reward_lobsters,
                 facing: player.facing,
                 walking_phase: player.walking_phase,
+                combat_mode: player.combat_mode,
+                punching: player.punching,
+                invulnerable: player.invulnerable,
+                blink_visible: player.blink_visible,
             })
             .collect(),
     };
@@ -2385,11 +2412,6 @@ fn render_game_frame(
     }
 }
 
-fn draw_pixel_block(frame: &mut FrameBuffer, x: i32, y: i32, color: Color) {
-    frame.put(x, y, '█', color);
-    frame.put(x + 1, y, '█', color);
-}
-
 fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
@@ -2416,187 +2438,6 @@ fn clip_to_display_width(text: &str, width: usize) -> String {
     clipped
 }
 
-fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardEntry]) {
-    if !should_render_lobster_leaderboard(frame.width, frame.height) {
-        return;
-    }
-
-    let leaders = lobster_leaders(leaderboard);
-    if leaders.is_empty() {
-        return;
-    }
-
-    let panel_width = lobster_leaderboard_width(frame.width);
-    let x = frame.width as i32 - panel_width as i32 - 1;
-    let mut line_y = 3;
-    let max_y = frame.height as i32 - 2;
-    draw_clipped_text(frame, x, 2, "🦞 leaders", panel_width, ACCENT_2);
-
-    for (index, player) in leaders.into_iter().enumerate() {
-        if line_y > max_y {
-            break;
-        }
-        let line = format!(
-            "{:>2}. @{:<12} {:>8} {}",
-            index + 1,
-            player.username,
-            format_lobsters(player.lobsters),
-            player.profile_url
-        );
-        draw_clipped_text(frame, x, line_y, &line, panel_width, HUD);
-        line_y += 1;
-        if index < 3 && line_y <= max_y {
-            let tokens = format!(
-                "    tokens all time {}",
-                format_token_points(player.all_time_tokens)
-            );
-            draw_clipped_text(frame, x, line_y, &tokens, panel_width, FG_DIM);
-            line_y += 1;
-        }
-    }
-}
-
-fn should_render_lobster_leaderboard(width: u16, height: u16) -> bool {
-    width > 150 && height >= 7
-}
-
-fn lobster_leaderboard_width(width: u16) -> usize {
-    (width as usize - 2).min(58)
-}
-
-fn lobster_leaders(leaderboard: &[LeaderboardEntry]) -> Vec<&LeaderboardEntry> {
-    let mut leaders = leaderboard
-        .iter()
-        .filter(|entry| !entry.username.trim().is_empty())
-        .collect::<Vec<_>>();
-    leaders.sort_by(|a, b| {
-        b.lobsters
-            .cmp(&a.lobsters)
-            .then_with(|| a.username.to_lowercase().cmp(&b.username.to_lowercase()))
-    });
-    leaders.truncate(10);
-    leaders
-}
-
-fn draw_starfield(frame: &mut FrameBuffer) {
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or(0.0);
-    for y in 0..frame.height {
-        for x in 0..frame.width {
-            let seed = hash_coords(x as i32, y as i32, 0x5f3759df);
-            let placement = unit_from_hash(seed);
-            let large = placement < 0.0022;
-            let small = placement < 0.019;
-            if !large && !small {
-                continue;
-            }
-
-            if large {
-                let phase = unit_from_hash(seed ^ 0x9e3779b9) * 12.0;
-                let noise = perlin3(x as f64 * 0.075, y as f64 * 0.12, time * 0.18 + phase);
-                let level = (((noise + 1.0) * 1.5).floor() as i32).clamp(0, 2);
-                let (ch, color) = match level {
-                    0 => ('+', STAR_MID),
-                    1 => ('*', STAR_MID),
-                    _ => ('*', STAR_BRIGHT),
-                };
-                frame.put(x as i32, y as i32, ch, color);
-            } else {
-                let color = if placement < 0.006 {
-                    STAR_MID
-                } else {
-                    STAR_DIM
-                };
-                frame.put(x as i32, y as i32, '.', color);
-            }
-        }
-    }
-}
-
-fn perlin3(x: f64, y: f64, z: f64) -> f64 {
-    let xi = x.floor() as i32;
-    let yi = y.floor() as i32;
-    let zi = z.floor() as i32;
-    let xf = x - xi as f64;
-    let yf = y - yi as f64;
-    let zf = z - zi as f64;
-    let u = perlin_fade(xf);
-    let v = perlin_fade(yf);
-    let w = perlin_fade(zf);
-
-    let n000 = gradient_dot(xi, yi, zi, xf, yf, zf);
-    let n100 = gradient_dot(xi + 1, yi, zi, xf - 1.0, yf, zf);
-    let n010 = gradient_dot(xi, yi + 1, zi, xf, yf - 1.0, zf);
-    let n110 = gradient_dot(xi + 1, yi + 1, zi, xf - 1.0, yf - 1.0, zf);
-    let n001 = gradient_dot(xi, yi, zi + 1, xf, yf, zf - 1.0);
-    let n101 = gradient_dot(xi + 1, yi, zi + 1, xf - 1.0, yf, zf - 1.0);
-    let n011 = gradient_dot(xi, yi + 1, zi + 1, xf, yf - 1.0, zf - 1.0);
-    let n111 = gradient_dot(xi + 1, yi + 1, zi + 1, xf - 1.0, yf - 1.0, zf - 1.0);
-
-    let x00 = lerp(n000, n100, u);
-    let x10 = lerp(n010, n110, u);
-    let x01 = lerp(n001, n101, u);
-    let x11 = lerp(n011, n111, u);
-    let y0 = lerp(x00, x10, v);
-    let y1 = lerp(x01, x11, v);
-    lerp(y0, y1, w).clamp(-1.0, 1.0)
-}
-
-fn gradient_dot(ix: i32, iy: i32, iz: i32, x: f64, y: f64, z: f64) -> f64 {
-    (match hash_coords3(ix, iy, iz) & 15 {
-        0 => x + y,
-        1 => -x + y,
-        2 => x - y,
-        3 => -x - y,
-        4 => x + z,
-        5 => -x + z,
-        6 => x - z,
-        7 => -x - z,
-        8 => y + z,
-        9 => -y + z,
-        10 => y - z,
-        11 => -y - z,
-        12 => x + y,
-        13 => -x + y,
-        14 => -y + z,
-        _ => -y - z,
-    }) * 0.7071067811865475
-}
-
-fn perlin_fade(t: f64) -> f64 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
-
-fn lerp(a: f64, b: f64, t: f64) -> f64 {
-    a + (b - a) * t
-}
-
-fn hash_coords(x: i32, y: i32, seed: u32) -> u32 {
-    hash_mix((x as u32).wrapping_mul(0x8da6b343) ^ (y as u32).wrapping_mul(0xd8163841) ^ seed)
-}
-
-fn hash_coords3(x: i32, y: i32, z: i32) -> u32 {
-    hash_mix(
-        (x as u32).wrapping_mul(0x8da6b343)
-            ^ (y as u32).wrapping_mul(0xd8163841)
-            ^ (z as u32).wrapping_mul(0xcb1ab31f),
-    )
-}
-
-fn hash_mix(mut value: u32) -> u32 {
-    value ^= value >> 16;
-    value = value.wrapping_mul(0x7feb352d);
-    value ^= value >> 15;
-    value = value.wrapping_mul(0x846ca68b);
-    value ^ (value >> 16)
-}
-
-fn unit_from_hash(value: u32) -> f64 {
-    value as f64 / u32::MAX as f64
-}
-
 fn format_count(value: u64) -> String {
     let (scaled, suffix) = if value >= 1_000_000_000 {
         (value as f64 / 1_000_000_000.0, "B")
@@ -2616,6 +2457,7 @@ fn format_count(value: u64) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_token_points(tokens: u64) -> String {
     format!("Ŧ{}", format_count(tokens))
 }
@@ -2632,10 +2474,12 @@ fn lobster_yield_per_hour(total_tokens: u64, rate_token_unit: u64) -> f64 {
     total_tokens as f64 / rate_token_unit as f64 * 60.0
 }
 
+#[cfg(test)]
 fn format_lobsters_per_hour(lobsters_per_hour: f64) -> String {
     format!("🦞{}", format_rate(lobsters_per_hour))
 }
 
+#[cfg(test)]
 fn format_rate(value: f64) -> String {
     if !value.is_finite() || value < 0.0 {
         return "invalid".to_string();
@@ -2653,114 +2497,6 @@ fn format_rate(value: f64) -> String {
         text.pop();
     }
     text
-}
-
-fn earth_land(position: Vec3) -> bool {
-    let lat = position.z.asin();
-    let lon = position.y.atan2(position.x);
-    let x = (((lon + std::f64::consts::PI) / std::f64::consts::TAU) * land_mask::LAND_MASK_W as f64)
-        .floor()
-        .rem_euclid(land_mask::LAND_MASK_W as f64) as usize;
-    let y = (((std::f64::consts::FRAC_PI_2 - lat) / std::f64::consts::PI)
-        * land_mask::LAND_MASK_H as f64)
-        .floor()
-        .clamp(0.0, (land_mask::LAND_MASK_H - 1) as f64) as usize;
-    land_mask::LAND_MASK_ROWS[y].as_bytes()[x] == b'1'
-}
-
-fn land_char(position: Vec3) -> char {
-    let lat = position.z.asin();
-    if lat.abs() > 1.15 {
-        '*'
-    } else if ((lat * 31.0 + position.x * 17.0 + position.y * 13.0).sin()) > 0.25 {
-        '#'
-    } else {
-        '+'
-    }
-}
-
-fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) {
-    let color = if player.is_self {
-        PLAYER_SELF
-    } else if player.is_fake {
-        PLAYER_NPC
-    } else {
-        PLAYER_OTHER
-    };
-    let facing_right = player.facing > 0;
-    let is_airborne = player.jump_height > JUMP_GROUND_EPSILON;
-    let legs = if is_airborne {
-        match player.jump_leg_pose {
-            -1 => "//",
-            2 => "\\\\",
-            1 => "/\\",
-            _ => "||",
-        }
-    } else if facing_right {
-        match player.walking_phase % 4 {
-            0 => "/|",
-            1 => "|/",
-            2 => "|\\",
-            _ => "||",
-        }
-    } else {
-        match player.walking_phase % 4 {
-            0 => "|\\",
-            1 => "\\|",
-            2 => "/|",
-            _ => "||",
-        }
-    };
-    let lift = player.jump_height.ceil().clamp(0.0, 2.0) as i32;
-    if lift > 0 {
-        let shadow = if player.jump_height > 1.2 {
-            " . "
-        } else {
-            "..."
-        };
-        frame.text(x - 1, y, shadow, FG_V_DIM);
-    }
-    let body_y = y - lift;
-    let head = if player.equipped_head.trim().is_empty() {
-        "0"
-    } else {
-        player.equipped_head.as_str()
-    };
-    let head_row = if head.is_ascii() {
-        format!(" {head} ")
-    } else {
-        format!("{head} ")
-    };
-    let head_shift = facing_right && head != "0";
-    let head_x = if head.is_ascii() { x - 1 } else { x } - i32::from(head_shift);
-    let chest = if facing_right { "-]-" } else { "-[-" };
-    let legs_x = if facing_right { x - 2 } else { x - 1 };
-    let rows = [
-        (0, head_x, head_row),
-        (1, x - 1, chest.to_string()),
-        (2, legs_x, format!(" {legs}")),
-    ];
-    for (dy, row_x, text) in rows {
-        frame.text(row_x, body_y - 2 + dy, &text, color);
-    }
-    if !player.name.is_empty() {
-        let label = format!("@{}", player.name);
-        let label_x = x - (display_width(&label) as i32 / 2);
-        if player.pickup_reward_lobsters > 0 {
-            let reward = format!("+{}", format_lobsters(player.pickup_reward_lobsters));
-            let reward_x = x - (display_width(&reward) as i32 / 2);
-            frame.text(reward_x, body_y - 5, &reward, ACCENT_2);
-        }
-        if !player.is_fake {
-            let points = format_token_points(player.points);
-            let points_x = x - (display_width(&points) as i32 / 2);
-            let points_color = if player.is_self { ACCENT_1 } else { FG_DIM };
-            frame.text(points_x, body_y - 3, &points, points_color);
-            frame.text(label_x, body_y - 4, &label, HUD);
-        } else {
-            frame.text(label_x, body_y - 3, &label, HUD);
-        }
-    }
 }
 
 fn diff_frames(previous: Option<&FrameBuffer>, current: &FrameBuffer) -> Vec<AnsiAction> {
@@ -3471,7 +3207,10 @@ mod tests {
 
     #[test]
     fn wrap_text_splits_long_urls() {
-        let lines = wrap_text("use https://x.com/i/oauth2/authorize?response_type=code", 16);
+        let lines = wrap_text(
+            "use https://x.com/i/oauth2/authorize?response_type=code",
+            16,
+        );
         assert_eq!(
             lines,
             vec![
