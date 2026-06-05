@@ -789,7 +789,19 @@ fn load_state(path: &PathBuf) -> anyhow::Result<PersistedState> {
     }
     let data =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&data).with_context(|| format!("failed to parse {}", path.display()))
+    match serde_json::from_str(&data) {
+        Ok(state) => Ok(state),
+        Err(error) => {
+            let backup = path.with_extension("json.corrupt");
+            let _ = fs::rename(path, &backup);
+            eprintln!(
+                "Ignoring invalid local state at {} ({error}). A backup was written to {}.",
+                path.display(),
+                backup.display()
+            );
+            Ok(PersistedState::default())
+        }
+    }
 }
 
 fn save_state(path: &PathBuf, state: &PersistedState) -> anyhow::Result<()> {
