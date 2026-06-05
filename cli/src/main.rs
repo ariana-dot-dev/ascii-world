@@ -2232,6 +2232,15 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
+        let word_chunks = split_to_display_width(word, width);
+        if word_chunks.len() > 1 {
+            if !current.is_empty() {
+                lines.push(current);
+                current = String::new();
+            }
+            lines.extend(word_chunks);
+            continue;
+        }
         let word_width = display_width(word);
         let next_len = if current.is_empty() {
             word_width
@@ -2252,6 +2261,29 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         lines.push(current);
     }
     lines
+}
+
+fn split_to_display_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || display_width(text) <= width {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for ch in text.chars() {
+        let ch_width = char_display_width(ch);
+        if current_width + ch_width > width && !current.is_empty() {
+            chunks.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn short_method(method: &str) -> &'static str {
@@ -3435,5 +3467,20 @@ mod tests {
     fn websocket_unauthorized_is_auth_rejected_through_error_chain() {
         let error = anyhow!("HTTP error: 401 Unauthorized").context("failed to connect websocket");
         assert!(is_auth_rejected(&error));
+    }
+
+    #[test]
+    fn wrap_text_splits_long_urls() {
+        let lines = wrap_text("use https://x.com/i/oauth2/authorize?response_type=code", 16);
+        assert_eq!(
+            lines,
+            vec![
+                "use".to_string(),
+                "https://x.com/i/".to_string(),
+                "oauth2/authorize".to_string(),
+                "?response_type=c".to_string(),
+                "ode".to_string(),
+            ]
+        );
     }
 }
