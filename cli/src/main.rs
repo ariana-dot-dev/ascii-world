@@ -1506,7 +1506,7 @@ struct Color(u8, u8, u8);
 const PLANET_OUTLINE: Color = Color(95, 165, 95);
 const PLANET_LAND: Color = Color(80, 145, 80);
 const PLANET_WATER: Color = Color(45, 75, 110);
-const PLAYER_SELF: Color = Color(80, 180, 255);
+const PLAYER_SELF: Color = Color(25, 215, 255);
 const PLAYER_NPC: Color = Color(255, 190, 125);
 const PLAYER_OTHER: Color = Color(245, 245, 245);
 const HUD: Color = Color(120, 120, 120);

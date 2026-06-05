@@ -223,7 +223,7 @@ pub struct Color(pub u8, pub u8, pub u8);
 const PLANET_OUTLINE: Color = Color(95, 165, 95);
 const PLANET_LAND: Color = Color(80, 145, 80);
 const PLANET_WATER: Color = Color(45, 75, 110);
-const PLAYER_SELF: Color = Color(80, 180, 255);
+const PLAYER_SELF: Color = Color(25, 215, 255);
 const PLAYER_NPC: Color = Color(255, 190, 125);
 const PLAYER_OTHER: Color = Color(245, 245, 245);
 const HUD: Color = Color(120, 120, 120);
@@ -435,7 +435,7 @@ pub fn render_game_frame(
             frame.text(economy_x.max(0), 0, &economy, HUD);
         }
         let promo_x = width as i32 - display_width(HEADER_PROMO) as i32 - 1;
-        frame.text(promo_x.max(0), 1, HEADER_PROMO, ACCENT_2);
+        frame.text(promo_x.max(0), 1, HEADER_PROMO, HUD);
     }
     if options.show_pixel_inventory {
         draw_pixel_inventory(&mut frame, selected_pixel_color, pixel_inventory);
@@ -610,9 +610,9 @@ fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardE
     }
     let panel_width = lobster_leaderboard_width(frame.width);
     let x = frame.width as i32 - panel_width as i32 - 1;
-    let mut line_y = 3;
+    let mut line_y = 4;
     let max_y = frame.height as i32 - 2;
-    draw_clipped_text(frame, x, 2, "\u{1f99e} leaders", panel_width, ACCENT_2);
+    draw_clipped_text(frame, x, 3, "\u{1f99e} leaders", panel_width, ACCENT_2);
     for (index, player) in leaders.into_iter().enumerate() {
         if line_y > max_y {
             break;
