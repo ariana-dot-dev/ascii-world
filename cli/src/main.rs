@@ -739,6 +739,10 @@ async fn poll_x_login(backend_url: &str, poll_token: &str) -> anyhow::Result<Log
 }
 
 fn load_dotenv() {
+    if option_env!("GAME_ENV") == Some("production") {
+        return;
+    }
+
     dotenvy::dotenv().ok();
     dotenvy::from_path_override("cli/.env").ok();
     if env::var("GAME_BACKEND_URL").is_err() {
