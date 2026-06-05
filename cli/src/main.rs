@@ -23,12 +23,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
 mod land_mask;
 
 const ONBOARDING_VERSION: u32 = 3;
 const PIXEL_COLOR_COUNT: usize = 5;
+const JUMP_GROUND_EPSILON: f64 = 0.02;
+const CAMERA_FOLLOW_STIFFNESS: f64 = 3.6;
+const CAMERA_FOLLOW_DAMPING: f64 = 5.4;
+const CAMERA_PREDICTION_SECONDS: f64 = 0.9;
+const CAMERA_MAX_PREDICTION_RADIANS: f64 = 0.34;
+const CAMERA_MAX_SPEED_RADIANS_PER_SECOND: f64 = 0.95;
+const CAMERA_MAX_LAG_RADIANS: f64 = 0.92;
+const CAMERA_SOFT_LAG_RADIANS: f64 = 0.58;
 const FOOTER_TEXT: &str =
     "Made and hosted by agents on https://box.ascii.dev, the cheapest and most powerful AI sandboxes";
 
@@ -480,6 +489,11 @@ async fn run_client(
         }
 
         if last_frame.elapsed() >= Duration::from_micros(16_667) {
+            let frame_started = Instant::now();
+            let frame_dt = frame_started
+                .duration_since(last_frame)
+                .as_secs_f64()
+                .clamp(0.0, 0.05);
             if let Some(worker) = &token_worker {
                 while let Ok(snapshot) = worker.receiver.try_recv() {
                     token_delta = snapshot;
@@ -512,7 +526,8 @@ async fn run_client(
             if rewards_visible && reward_dialog_opened_at.is_none() {
                 reward_dialog_opened_at = Some(Instant::now());
             }
-            let visible = VisibleGameState::from_client_state(&live_state, &mut camera, cols, rows);
+            let visible =
+                VisibleGameState::from_client_state(&live_state, &mut camera, cols, rows, frame_dt);
             let self_pixels = live_state
                 .self_player()
                 .map(|player| player.owned_pixels)
@@ -553,7 +568,7 @@ async fn run_client(
             let actions =
                 renderer.render_app(&visible, panel_progress, selected_pixel_color, self_pixels);
             apply_ansi_actions(&actions)?;
-            last_frame = Instant::now();
+            last_frame = frame_started;
         }
 
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -879,6 +894,8 @@ struct Snapshot {
     players: Vec<PlayerSnapshot>,
     leaderboard: Vec<LeaderboardEntry>,
     placed_pixels: Vec<PlacedPixel>,
+    pickups: Vec<PickupSnapshot>,
+    pickup_rewards: Vec<PickupRewardSnapshot>,
     economy_rules: EconomyRulesSnapshot,
 }
 
@@ -891,6 +908,19 @@ struct EconomyRulesSnapshot {
 struct PlacedPixel {
     position: [f64; 3],
     color: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PickupSnapshot {
+    id: u64,
+    position: [f64; 3],
+    emoji: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PickupRewardSnapshot {
+    player_id: String,
+    lobsters: u64,
 }
 
 fn pixel_shortcut(ch: char) -> Option<usize> {
@@ -927,6 +957,8 @@ struct PlayerSnapshot {
     owned_heads: Vec<String>,
     owned_pixels: [u64; PIXEL_COLOR_COUNT],
     jump_height: f64,
+    #[serde(default)]
+    jump_leg_pose: i8,
     #[serde(default)]
     facing: i8,
     walking_phase: u64,
@@ -986,6 +1018,11 @@ fn validate_snapshot(snapshot: &Snapshot) -> anyhow::Result<()> {
             anyhow::bail!("backend sent invalid placed pixel color {}", pixel.color);
         }
     }
+    for pickup in &snapshot.pickups {
+        if Vec3::from_array(pickup.position).is_none() {
+            anyhow::bail!("backend sent invalid pickup position {}", pickup.id);
+        }
+    }
     for player in &snapshot.players {
         if player.owned_pixels.len() != PIXEL_COLOR_COUNT {
             anyhow::bail!(
@@ -1021,8 +1058,9 @@ struct InputTracker {
 impl InputTracker {
     fn current(&mut self) -> InputState {
         let now = Instant::now();
-        let expiry = Duration::from_millis(140);
-        let active = |last: &mut Option<Instant>| {
+        let movement_expiry = Duration::from_millis(1_500);
+        let jump_expiry = Duration::from_millis(180);
+        let active = |last: &mut Option<Instant>, expiry: Duration| {
             if last
                 .map(|instant| now.duration_since(instant) <= expiry)
                 .unwrap_or(false)
@@ -1034,11 +1072,11 @@ impl InputTracker {
             }
         };
         InputState {
-            up: active(&mut self.up),
-            down: active(&mut self.down),
-            left: active(&mut self.left),
-            right: active(&mut self.right),
-            jump: active(&mut self.jump),
+            up: active(&mut self.up, movement_expiry),
+            down: active(&mut self.down, movement_expiry),
+            left: active(&mut self.left, movement_expiry),
+            right: active(&mut self.right, movement_expiry),
+            jump: active(&mut self.jump, jump_expiry),
         }
     }
 }
@@ -1132,6 +1170,8 @@ impl Vec3 {
 struct CameraState {
     focus: Vec3,
     up: Vec3,
+    velocity: Vec3,
+    previous_self_position: Option<Vec3>,
 }
 
 impl Default for CameraState {
@@ -1139,6 +1179,8 @@ impl Default for CameraState {
         Self {
             focus: Vec3::X,
             up: Vec3::Z,
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            previous_self_position: None,
         }
     }
 }
@@ -1155,6 +1197,7 @@ struct VisibleGameState {
     lobster_yield_per_hour: f64,
     leaderboard: Vec<LeaderboardEntry>,
     placed_pixels: Vec<PlacedPixel>,
+    pickups: Vec<PickupSnapshot>,
     players: Vec<VisiblePlayer>,
 }
 
@@ -1169,6 +1212,8 @@ struct VisiblePlayer {
     lobster_yield_per_hour: f64,
     equipped_head: String,
     jump_height: f64,
+    jump_leg_pose: i8,
+    pickup_reward_lobsters: u64,
     facing: i8,
     walking_phase: u64,
 }
@@ -1179,6 +1224,7 @@ impl VisibleGameState {
         camera: &mut CameraState,
         width: u16,
         height: u16,
+        dt: f64,
     ) -> Self {
         let Some(snapshot) = state.snapshot.clone() else {
             return Self {
@@ -1192,6 +1238,7 @@ impl VisibleGameState {
                 lobster_yield_per_hour: 0.0,
                 leaderboard: Vec::new(),
                 placed_pixels: Vec::new(),
+                pickups: Vec::new(),
                 players: Vec::new(),
             };
         };
@@ -1206,16 +1253,7 @@ impl VisibleGameState {
                     .map(PlayerSnapshot::position_vec)
             })
             .unwrap_or(camera.focus);
-        let angle_from_focus = camera.focus.dot(self_position).clamp(-1.0, 1.0).acos();
-        let follow_radius = 0.38;
-        if angle_from_focus > follow_radius {
-            let step = angle_from_focus - follow_radius;
-            let tangent_to_self = self_position
-                .add(camera.focus.scale(-self_position.dot(camera.focus)))
-                .normalize();
-            let rotation_axis = camera.focus.cross(tangent_to_self).normalize();
-            camera.focus = camera.focus.rotate_around(rotation_axis, step).normalize();
-        }
+        update_camera_follow(camera, self_position, dt);
         camera.up = stable_camera_up(camera.focus);
 
         let players: Vec<VisiblePlayer> = snapshot
@@ -1241,6 +1279,13 @@ impl VisibleGameState {
                     ),
                     equipped_head,
                     jump_height: player.jump_height,
+                    jump_leg_pose: player.jump_leg_pose,
+                    pickup_reward_lobsters: snapshot
+                        .pickup_rewards
+                        .iter()
+                        .filter(|reward| reward.player_id == player.id)
+                        .map(|reward| reward.lobsters)
+                        .sum(),
                     facing: player.facing,
                     walking_phase: player.walking_phase,
                 }
@@ -1269,8 +1314,69 @@ impl VisibleGameState {
             lobster_yield_per_hour: self_economy.1,
             leaderboard: snapshot.leaderboard,
             placed_pixels: snapshot.placed_pixels,
+            pickups: snapshot.pickups,
             players,
         }
+    }
+}
+
+fn update_camera_follow(camera: &mut CameraState, self_position: Vec3, dt: f64) {
+    if dt <= 0.0 {
+        return;
+    }
+
+    camera.focus = camera.focus.normalize();
+    let target = self_position.normalize();
+    let tangent_to_target = target.add(camera.focus.scale(-target.dot(camera.focus)));
+    let distance = tangent_to_target.length();
+
+    let mut angle = camera.focus.dot(target).clamp(-1.0, 1.0).acos();
+    if distance > 1e-6 && angle.is_finite() {
+        let direction = tangent_to_target.scale(1.0 / distance);
+        let acceleration = direction
+            .scale(angle * CAMERA_FOLLOW_STIFFNESS)
+            .add(camera.velocity.scale(-CAMERA_FOLLOW_DAMPING));
+        camera.velocity = camera.velocity.add(acceleration.scale(dt));
+    } else {
+        camera.velocity = camera
+            .velocity
+            .scale((1.0 - CAMERA_FOLLOW_DAMPING * dt).max(0.0));
+    }
+
+    camera.velocity = camera
+        .velocity
+        .add(camera.focus.scale(-camera.velocity.dot(camera.focus)));
+    let speed = camera.velocity.length();
+    if speed > CAMERA_MAX_SPEED_RADIANS_PER_SECOND {
+        camera.velocity = camera
+            .velocity
+            .scale(CAMERA_MAX_SPEED_RADIANS_PER_SECOND / speed);
+    }
+
+    let step = camera.velocity.length() * dt;
+    if step > 1e-6 {
+        let direction = camera.velocity.normalize();
+        let rotation_axis = camera.focus.cross(direction).normalize();
+        camera.focus = camera.focus.rotate_around(rotation_axis, step).normalize();
+        camera.velocity = camera
+            .velocity
+            .add(camera.focus.scale(-camera.velocity.dot(camera.focus)));
+    }
+
+    angle = camera.focus.dot(target).clamp(-1.0, 1.0).acos();
+    if angle > CAMERA_MAX_LAG_RADIANS {
+        let tangent = target
+            .add(camera.focus.scale(-target.dot(camera.focus)))
+            .normalize();
+        let rotation_axis = camera.focus.cross(tangent).normalize();
+        camera.focus = camera
+            .focus
+            .rotate_around(rotation_axis, angle - CAMERA_MAX_LAG_RADIANS)
+            .normalize();
+        camera.velocity = camera
+            .velocity
+            .add(camera.focus.scale(-camera.velocity.dot(camera.focus)))
+            .scale(0.65);
     }
 }
 
@@ -1334,6 +1440,7 @@ const ACCENT_1: Color = Color(170, 235, 170);
 const ACCENT_1_DIM: Color = Color(95, 165, 95);
 const ACCENT_2: Color = Color(255, 190, 125);
 const ACCENT_2_DIM: Color = Color(180, 125, 70);
+const WIDE_CONTINUATION: char = '\0';
 const PIXEL_COLORS: [Color; PIXEL_COLOR_COUNT] = [
     Color(255, 80, 80),
     Color(80, 180, 255),
@@ -1395,8 +1502,27 @@ impl FrameBuffer {
     }
 
     fn text(&mut self, x: i32, y: i32, text: &str, fg: Color) {
-        for (offset, ch) in text.chars().enumerate() {
-            self.put(x + offset as i32, y, ch, fg);
+        let mut cursor = x;
+        for ch in text.chars() {
+            let width = char_display_width(ch);
+            if width == 0 {
+                continue;
+            }
+            if cursor + width as i32 > self.width as i32 {
+                break;
+            }
+            self.put(cursor, y, ch, fg);
+            for offset in 1..width {
+                self.put_cell(
+                    cursor + offset as i32,
+                    y,
+                    Cell {
+                        ch: WIDE_CONTINUATION,
+                        fg: Some(fg),
+                    },
+                );
+            }
+            cursor += width as i32;
         }
     }
 
@@ -1474,6 +1600,10 @@ enum UiBlock {
         lines: Vec<String>,
         color: Color,
     },
+    Preformatted {
+        lines: Vec<String>,
+        color: Color,
+    },
     Table {
         columns: Vec<String>,
         rows: Vec<UiRow>,
@@ -1489,16 +1619,28 @@ struct UiRow {
 
 impl UiPanel {
     fn onboarding(detected: &[ai_usage::DetectedTool]) -> Self {
-        let mut blocks = vec![UiBlock::Paragraph {
-            color: FG,
-            lines: vec![
-                "By logging in with X, you accept local token tracking for gameplay.".to_string(),
-                "We start counting now, then use new token activity to trigger game events and award points."
-                    .to_string(),
-                "The multiplayer world is hosted, but your local usage data is not uploaded or stored in the cloud."
-                    .to_string(),
-            ],
-        }];
+        let mut blocks = vec![
+            UiBlock::Preformatted {
+                color: ACCENT_1,
+                lines: vec![
+                    "   ___           _ _   _      __         __   __".to_string(),
+                    "  / _ | ___ ____(_|_) | | /| / /__  ____/ /__/ /".to_string(),
+                    " / __ |(_-</ __/ / /  | |/ |/ / _ \\/ __/ / _  / ".to_string(),
+                    "/_/ |_/___/\\__/_/_/   |__/|__/\\___/_/ /_/\\_,_/".to_string(),
+                ],
+            },
+            UiBlock::Paragraph {
+                color: FG,
+                lines: vec![
+                    "- We read supported local coding agents CLI logs on this machine.".to_string(),
+                    "- New local tokens become Ŧ points while you play.".to_string(),
+                    "- Ŧ points create 🦞 yield.".to_string(),
+                    "- 🦞 buy heads to look cool: 0, 📦, 🙂, 🤠, 😎, 🐸, 🦞, ☀️.".to_string(),
+                    "- 🦞 buy pixel packs to leave a mark on the world.".to_string(),
+                    "- The 🦞 leaderboard links each player to their X page.".to_string(),
+                ],
+            },
+        ];
 
         if detected.is_empty() {
             blocks.push(UiBlock::Paragraph {
@@ -1774,7 +1916,7 @@ fn render_app_frame(
     let layout = app_layout(width, height, panel.map(|(_, progress)| progress));
     let left_panel_visible = layout.panel.is_some() && layout.game.x > 0;
     let game_options = GameRenderOptions {
-        show_lobster_leaderboard: width > 200 && !left_panel_visible,
+        show_lobster_leaderboard: width > 150 && !left_panel_visible,
     };
     let game_state = VisibleGameState {
         width: layout.game.width.max(1),
@@ -1845,6 +1987,15 @@ fn draw_block(
                 }
             }
         }
+        UiBlock::Preformatted { lines, color } => {
+            for text in lines {
+                if *line > max_y {
+                    return;
+                }
+                draw_clipped_text(frame, x, *line, text, inner_width, *color);
+                *line += 1;
+            }
+        }
         UiBlock::Table { columns, rows } => {
             if *line > max_y {
                 return;
@@ -1897,7 +2048,7 @@ fn format_table_row(cells: &[String]) -> String {
 }
 
 fn draw_clipped_text(frame: &mut FrameBuffer, x: i32, y: i32, text: &str, width: usize, fg: Color) {
-    let clipped = text.chars().take(width).collect::<String>();
+    let clipped = clip_to_display_width(text, width);
     frame.text(x, y, &clipped, fg);
 }
 
@@ -1908,10 +2059,11 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
+        let word_width = display_width(word);
         let next_len = if current.is_empty() {
-            word.chars().count()
+            word_width
         } else {
-            current.chars().count() + 1 + word.chars().count()
+            display_width(&current) + 1 + word_width
         };
         if next_len > width && !current.is_empty() {
             lines.push(current);
@@ -2012,6 +2164,20 @@ fn render_game_frame(
         draw_pixel_block(&mut frame, sx, sy, PIXEL_COLORS[pixel.color]);
     }
 
+    for pickup in &state.pickups {
+        let Some(position) = Vec3::from_array(pickup.position) else {
+            continue;
+        };
+        if position.dot(view_normal) <= 0.0 {
+            continue;
+        }
+        let px = position.dot(right);
+        let py = position.dot(up);
+        let sx = (cx + px * radius_x).round() as i32;
+        let sy = (cy - py * radius_y).round() as i32;
+        frame.text(sx, sy, &pickup.emoji, ACCENT_2);
+    }
+
     let mut players = state.players.clone();
     players.sort_by(|a, b| {
         a.position
@@ -2032,8 +2198,8 @@ fn render_game_frame(
 
     frame.text(0, 0, "arrows move, space jumps, M market, esc exits", HUD);
     let economy = format!(
-        "tokens {}  yield {}/h  balance {}",
-        format_tokens(state.token_delta),
+        "tokens consumed since joining {}  => yield {}/h  balance {}",
+        format_token_points(state.token_delta),
         format_lobsters_per_hour(state.lobster_yield_per_hour),
         format_lobsters(state.lobsters)
     );
@@ -2073,7 +2239,7 @@ fn draw_pixel_inventory(
         draw_pixel_block(frame, x, y, PIXEL_COLORS[color]);
         x += 3;
         frame.text(x, y, &label, HUD);
-        x += label.chars().count() as i32 + 1;
+        x += display_width(&label) as i32 + 1;
     }
     frame.text(x, y, "P place", HUD);
 }
@@ -2105,12 +2271,29 @@ fn draw_footer(frame: &mut FrameBuffer) {
 }
 
 fn display_width(text: &str) -> usize {
-    text.chars()
-        .map(|ch| match ch {
-            '🦞' | '🙂' | '🤠' | '😎' | '🐸' | '☀' | '📦' => 2,
-            _ => 1,
-        })
-        .sum()
+    UnicodeWidthStr::width(text)
+}
+
+fn char_display_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn clip_to_display_width(text: &str, width: usize) -> String {
+    let mut clipped = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = char_display_width(ch);
+        if ch_width == 0 {
+            clipped.push(ch);
+            continue;
+        }
+        if used + ch_width > width {
+            break;
+        }
+        clipped.push(ch);
+        used += ch_width;
+    }
+    clipped
 }
 
 fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardEntry]) {
@@ -2126,7 +2309,7 @@ fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardE
     let panel_width = lobster_leaderboard_width(frame.width);
     let x = frame.width as i32 - panel_width as i32 - 1;
     let max_entries = ((frame.height as usize).saturating_sub(4)).min(10);
-    draw_clipped_text(frame, x, 2, "lobster leaders", panel_width, ACCENT_2);
+    draw_clipped_text(frame, x, 2, "🦞 leaders", panel_width, ACCENT_2);
 
     for (index, player) in leaders.into_iter().take(max_entries).enumerate() {
         let line = format!(
@@ -2141,7 +2324,7 @@ fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardE
 }
 
 fn should_render_lobster_leaderboard(width: u16, height: u16) -> bool {
-    width > 200 && height >= 7
+    width > 150 && height >= 7
 }
 
 fn lobster_leaderboard_width(width: u16) -> usize {
@@ -2300,10 +2483,6 @@ fn format_count(value: u64) -> String {
     }
 }
 
-fn format_tokens(tokens: u64) -> String {
-    format_count(tokens)
-}
-
 fn format_token_points(tokens: u64) -> String {
     format!("Ŧ{}", format_count(tokens))
 }
@@ -2376,7 +2555,15 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
         PLAYER_OTHER
     };
     let facing_right = player.facing > 0;
-    let legs = if facing_right {
+    let is_airborne = player.jump_height > JUMP_GROUND_EPSILON;
+    let legs = if is_airborne {
+        match player.jump_leg_pose {
+            -1 => "//",
+            2 => "\\\\",
+            1 => "/\\",
+            _ => "||",
+        }
+    } else if facing_right {
         match player.walking_phase % 4 {
             0 => "/|",
             1 => "|/",
@@ -2411,7 +2598,8 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
     } else {
         format!("{head} ")
     };
-    let head_x = if head.is_ascii() { x - 1 } else { x };
+    let head_shift = facing_right && head != "0";
+    let head_x = if head.is_ascii() { x - 1 } else { x } - i32::from(head_shift);
     let chest = if facing_right { "-]-" } else { "-[-" };
     let legs_x = if facing_right { x - 2 } else { x - 1 };
     let rows = [
@@ -2424,10 +2612,15 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
     }
     if !player.name.is_empty() {
         let label = format!("@{}", player.name);
-        let label_x = x - (label.chars().count() as i32 / 2);
+        let label_x = x - (display_width(&label) as i32 / 2);
+        if player.pickup_reward_lobsters > 0 {
+            let reward = format!("+{}", format_lobsters(player.pickup_reward_lobsters));
+            let reward_x = x - (display_width(&reward) as i32 / 2);
+            frame.text(reward_x, body_y - 5, &reward, ACCENT_2);
+        }
         if !player.is_fake {
             let points = format_token_points(player.points);
-            let points_x = x - (points.chars().count() as i32 / 2);
+            let points_x = x - (display_width(&points) as i32 / 2);
             let points_color = if player.is_self { ACCENT_1 } else { FG_DIM };
             frame.text(points_x, body_y - 4, &points, points_color);
         }
@@ -2451,6 +2644,10 @@ fn diff_frames(previous: Option<&FrameBuffer>, current: &FrameBuffer) -> Vec<Ans
         let mut x = 0;
         while x < current.width {
             let cell = current.get(x, y);
+            if cell.ch == WIDE_CONTINUATION {
+                x += 1;
+                continue;
+            }
             let changed = full_redraw
                 || previous
                     .map(|previous| previous.get(x, y) != cell)
@@ -2465,6 +2662,9 @@ fn diff_frames(previous: Option<&FrameBuffer>, current: &FrameBuffer) -> Vec<Ans
             let mut text = String::new();
             while x < current.width {
                 let next = current.get(x, y);
+                if next.ch == WIDE_CONTINUATION {
+                    break;
+                }
                 let next_changed = full_redraw
                     || previous
                         .map(|previous| previous.get(x, y) != next)
@@ -2497,7 +2697,7 @@ fn diff_frames(previous: Option<&FrameBuffer>, current: &FrameBuffer) -> Vec<Ans
                 }
                 _ => {}
             }
-            let text_width = text.chars().count() as u16;
+            let text_width = display_width(&text) as u16;
             actions.push(AnsiAction::Text(text));
             cursor = Some((start_x.saturating_add(text_width), y));
         }
@@ -3104,16 +3304,28 @@ mod tests {
         assert_eq!(format_lobsters_per_hour(7.5), "🦞7.5");
         assert_eq!(format_lobsters_per_hour(f64::NAN), "🦞invalid");
         assert_eq!(
-            format_lobsters_per_hour(lobster_yield_per_hour(1_800_000, 100_000_000,)),
-            "🦞1.08"
+            format_lobsters_per_hour(lobster_yield_per_hour(1_800_000, 6_000_000,)),
+            "🦞18"
         );
         assert_eq!(
-            format_lobsters_per_hour(lobster_yield_per_hour(100_000_000, 100_000_000,)),
-            "🦞60"
+            format_lobsters_per_hour(lobster_yield_per_hour(1_000_000, 6_000_000,)),
+            "🦞10"
         );
         assert_eq!(builtin_head("default"), "0");
         assert_eq!(builtin_head("box"), "📦");
         assert_eq!(equipped_head_glyph("default"), "0");
+    }
+
+    #[test]
+    fn wide_emoji_occupy_two_terminal_cells() {
+        assert_eq!(display_width("balance 🦞2312k"), 15);
+
+        let mut frame = FrameBuffer::new(8, 1);
+        frame.text(0, 0, "a🦞b", HUD);
+        assert_eq!(frame.get(0, 0).ch, 'a');
+        assert_eq!(frame.get(1, 0).ch, '🦞');
+        assert_eq!(frame.get(2, 0).ch, WIDE_CONTINUATION);
+        assert_eq!(frame.get(3, 0).ch, 'b');
     }
 
     #[test]

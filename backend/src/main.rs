@@ -106,6 +106,10 @@ struct Game {
 struct GameWorld {
     players: HashMap<String, Player>,
     placed_pixels: HashMap<String, PlacedPixel>,
+    pickups: HashMap<u64, Pickup>,
+    pickup_rewards: Vec<PickupReward>,
+    next_pickup_id: u64,
+    last_pickup_spawn: Instant,
     next_npc_id: u64,
     last_tick: Instant,
 }
@@ -123,6 +127,12 @@ struct Player {
     fake: bool,
     jump_height: f64,
     jump_velocity: f64,
+    jump_momentum: Option<Vec3>,
+    last_jump_started_at: Option<Instant>,
+    last_jump_momentum: Option<Vec3>,
+    jump_leg_pose: i8,
+    momentum_jump_chain: u8,
+    jump_momentum_multiplier: f64,
     npc_jump_seconds: f64,
     total_tokens: u64,
     lobster_micros: u64,
@@ -175,6 +185,34 @@ struct MarketItemSnapshot {
 struct PlacedPixel {
     position: [f64; 3],
     color: usize,
+}
+
+#[derive(Clone)]
+struct Pickup {
+    id: u64,
+    position: Vec3,
+    emoji: &'static str,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PickupSnapshot {
+    id: u64,
+    position: [f64; 3],
+    emoji: String,
+}
+
+#[derive(Clone)]
+struct PickupReward {
+    player_id: String,
+    lobsters: u64,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PickupRewardSnapshot {
+    player_id: String,
+    lobsters: u64,
 }
 
 #[derive(Clone)]
@@ -258,6 +296,8 @@ struct Snapshot {
     players: Vec<PlayerSnapshot>,
     leaderboard: Vec<LeaderboardEntry>,
     placed_pixels: Vec<PlacedPixel>,
+    pickups: Vec<PickupSnapshot>,
+    pickup_rewards: Vec<PickupRewardSnapshot>,
     economy_rules: EconomyRulesSnapshot,
 }
 
@@ -289,6 +329,7 @@ struct PlayerSnapshot {
     owned_heads: Vec<String>,
     owned_pixels: [u64; PIXEL_COLOR_COUNT],
     jump_height: f64,
+    jump_leg_pose: i8,
     facing: i8,
     walking_phase: u64,
 }
@@ -961,12 +1002,13 @@ async fn landing_page() -> Response {
 <style>
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
-html, body { margin: 0; min-height: 100%; background: #090909; color: #d7d0bf; }
+html, body { margin: 0; min-height: 100%; background: #1e1e1e; color: #cccccc; }
 body {
   display: grid;
+  grid-template-rows: 1fr auto;
   place-items: center;
-  min-height: 100vh;
-  padding: 24px 24px 72px;
+  min-height: 100svh;
+  padding: 2ch;
   font-family: "Lilex Mono", "Lilex Nerd Font Mono", "Lilex", ui-monospace, monospace;
   font-size: clamp(13px, 1.7vw, 18px);
   font-style: italic;
@@ -975,25 +1017,37 @@ body {
 }
 .screen {
   width: min(96vw, 96ch);
-  min-height: min(86vh, 30rem);
+  min-height: 0;
   display: grid;
   place-items: center;
-  padding: 2ch;
+  padding: 0;
 }
 .term {
   width: min(100%, 72ch);
-  color: #d7d0bf;
+  color: #cccccc;
   text-align: center;
   line-height: inherit;
 }
-.title { color: #d7d0bf; font: inherit; font-weight: 400; letter-spacing: 0; }
-.dim { color: #827d72; }
+.title { color: #569cd6; font: inherit; font-weight: 400; letter-spacing: 0; }
+.wordmark {
+  margin: 0 0 1.45em;
+  color: #569cd6;
+  font: inherit;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1;
+  letter-spacing: 0;
+  text-align: center;
+  white-space: pre;
+  overflow: visible;
+}
+.dim { color: #858585; }
 .cmd {
   display: block;
   width: 100%;
   margin: .3rem auto 1rem;
   padding: 0;
-  color: #d7d0bf;
+  color: #cccccc;
   background: transparent;
   border: 0;
   font: inherit;
@@ -1010,7 +1064,7 @@ button {
   appearance: none;
   background: transparent;
   border: 0;
-  color: #827d72;
+  color: #858585;
   font: inherit;
   font-style: normal;
   cursor: pointer;
@@ -1018,20 +1072,50 @@ button {
 }
 button::before { content: " "; }
 button::after { content: " "; }
-button[aria-pressed="true"] { color: #d7d0bf; }
+button[aria-pressed="true"] { color: #cccccc; }
 button[aria-pressed="true"]::before { content: "["; }
 button[aria-pressed="true"]::after { content: "]"; }
-button:focus-visible { outline: 1px solid #d7d0bf; outline-offset: 2px; }
+button[aria-pressed="true"]::before,
+button[aria-pressed="true"]::after { color: #569cd6; }
+button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
+.palette {
+  display: inline-grid;
+  grid-template-columns: repeat(8, 3ch);
+  grid-template-rows: repeat(2, 1em);
+  gap: 0;
+  margin-top: 1.45em;
+  line-height: 1;
+  font-style: normal;
+}
+.swatch {
+  width: 3ch;
+  height: 1em;
+  display: inline-block;
+  color: transparent;
+  overflow: hidden;
+}
+.c0 { background: #000000; }
+.c1 { background: #cd3131; }
+.c2 { background: #0dbc79; }
+.c3 { background: #e5e510; }
+.c4 { background: #2472c8; }
+.c5 { background: #bc3fbc; }
+.c6 { background: #11a8cd; }
+.c7 { background: #e5e5e5; }
+.c8 { background: #666666; }
+.c9 { background: #f14c4c; }
+.c10 { background: #23d18b; }
+.c11 { background: #f5f543; }
+.c12 { background: #3b8eea; }
+.c13 { background: #d670d6; }
+.c14 { background: #29b8db; }
+.c15 { background: #ffffff; }
 .footer {
-  position: fixed;
-  left: 2ch;
-  right: 2ch;
-  bottom: 2ch;
-  color: #827d72;
+  color: #858585;
   text-align: center;
 }
 .footer a {
-  color: inherit;
+  color: #569cd6;
   text-decoration: underline;
   text-underline-offset: .18em;
 }
@@ -1040,7 +1124,10 @@ button:focus-visible { outline: 1px solid #d7d0bf; outline-offset: 2px; }
 <body>
 <main class="screen">
 <section class="term" aria-label="Ascii World landing page">
-<div class="title">Ascii World</div>
+<pre class="wordmark" aria-label="Ascii World">   ___           _ _   _      __         __   __
+  / _ | ___ ____(_|_) | | /| / /__  ____/ /__/ /
+  / __ |(_-&lt;/ __/ / /  | |/ |/ / _ \/ __/ / _  / 
+/_/ |_/___/\__/_/_/   |__/|__/\___/_/ /_/\_,_/</pre>
 <div class="dim">The idle multiplayer game for vibe coders</div>
 <div class="toggle" role="group" aria-label="platform">
 <button type="button" data-platform="mac" aria-pressed="false" aria-label="macOS">🍎</button>
@@ -1050,6 +1137,10 @@ button:focus-visible { outline: 1px solid #d7d0bf; outline-offset: 2px; }
 <code id="install" class="cmd"></code>
 <div class="dim">once installed, run:</div>
 <code id="run" class="cmd"></code>
+<div class="palette" aria-label="Dark+ terminal colors">
+<span class="swatch c0">###</span><span class="swatch c1">###</span><span class="swatch c2">###</span><span class="swatch c3">###</span><span class="swatch c4">###</span><span class="swatch c5">###</span><span class="swatch c6">###</span><span class="swatch c7">###</span>
+<span class="swatch c8">###</span><span class="swatch c9">###</span><span class="swatch c10">###</span><span class="swatch c11">###</span><span class="swatch c12">###</span><span class="swatch c13">###</span><span class="swatch c14">###</span><span class="swatch c15">###</span>
+</div>
 </section>
 </main>
 <footer class="footer">Made and hosted by agents on <a href="https://box.ascii.dev">box.ascii.dev</a>, the cheapest and most powerful AI sandboxes</footer>
@@ -1136,7 +1227,11 @@ async fn spectate(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl I
 async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
     let player_id = Uuid::new_v4().to_string();
     let rewards = user.rewards.clone();
-    state.game.add_player(player_id.clone(), user).await;
+    if let Some(save) = state.game.add_player(player_id.clone(), user).await {
+        if let Err(err) = persist_economy(&state.db, save).await {
+            error!("failed to persist replaced player economy on reconnect: {err}");
+        }
+    }
 
     let (mut sender, mut receiver) = socket.split();
     let mut snapshots = state.game.snapshots.subscribe();
@@ -1346,6 +1441,10 @@ impl Game {
         let mut world = GameWorld {
             players,
             placed_pixels: HashMap::new(),
+            pickups: HashMap::new(),
+            pickup_rewards: Vec::new(),
+            next_pickup_id: 0,
+            last_pickup_spawn: Instant::now(),
             next_npc_id: 0,
             last_tick: Instant::now(),
         };
@@ -1356,13 +1455,95 @@ impl Game {
         })
     }
 
-    async fn add_player(&self, id: String, user: GameUser) {
-        let position = {
-            let mut rng = rand::rng();
-            Vec3::random_unit(&mut rng)
-        };
+    async fn add_player(&self, id: String, user: GameUser) -> Option<EconomySave> {
         let mut world = self.world.lock().await;
-        remove_random_npc(&mut world);
+        let replaced_id = world.players.iter().find_map(|(player_id, player)| {
+            if !player.fake && player.user_id == Some(user.id) {
+                Some(player_id.clone())
+            } else {
+                None
+            }
+        });
+        let replaced = replaced_id.and_then(|player_id| world.players.remove(&player_id));
+
+        if replaced.is_none() {
+            remove_random_npc(&mut world);
+        }
+
+        let mut replaced_save = None;
+        let (
+            position,
+            basis_up,
+            total_tokens,
+            lobster_micros,
+            equipped_head,
+            owned_heads,
+            owned_pixels,
+            jump_height,
+            jump_velocity,
+            jump_momentum,
+            last_jump_started_at,
+            last_jump_momentum,
+            jump_leg_pose,
+            momentum_jump_chain,
+            jump_momentum_multiplier,
+            facing,
+            walking_phase,
+        ) = if let Some(mut player) = replaced {
+            accrue_lobsters(&mut player, Instant::now());
+            replaced_save = player.user_id.map(|user_id| EconomySave {
+                user_id,
+                total_tokens: player.total_tokens,
+                lobster_micros: player.lobster_micros,
+                equipped_head: player.equipped_head.clone(),
+                owned_heads: player.owned_heads.clone(),
+                owned_pixels: player.owned_pixels,
+            });
+            (
+                player.position,
+                player.basis_up,
+                player.total_tokens,
+                player.lobster_micros,
+                player.equipped_head,
+                player.owned_heads,
+                player.owned_pixels,
+                player.jump_height,
+                player.jump_velocity,
+                player.jump_momentum,
+                player.last_jump_started_at,
+                player.last_jump_momentum,
+                player.jump_leg_pose,
+                player.momentum_jump_chain,
+                player.jump_momentum_multiplier,
+                player.facing,
+                player.walking_phase,
+            )
+        } else {
+            let position = {
+                let mut rng = rand::rng();
+                Vec3::random_unit(&mut rng)
+            };
+            (
+                position,
+                position.any_tangent(),
+                user.economy.total_tokens,
+                user.economy.lobster_micros,
+                user.economy.equipped_head,
+                user.economy.owned_heads,
+                user.economy.owned_pixels,
+                0.0,
+                0.0,
+                None,
+                None,
+                None,
+                0,
+                0,
+                1.0,
+                0,
+                0,
+            )
+        };
+
         world.players.insert(
             id.clone(),
             Player {
@@ -1372,24 +1553,31 @@ impl Game {
                 name: user.username,
                 planet_id: 0,
                 position,
-                basis_up: position.any_tangent(),
+                basis_up,
                 input: InputState::default(),
                 fake: false,
-                jump_height: 0.0,
-                jump_velocity: 0.0,
+                jump_height,
+                jump_velocity,
+                jump_momentum,
+                last_jump_started_at,
+                last_jump_momentum,
+                jump_leg_pose,
+                momentum_jump_chain,
+                jump_momentum_multiplier,
                 npc_jump_seconds: 0.0,
-                total_tokens: user.economy.total_tokens,
-                lobster_micros: user.economy.lobster_micros,
+                total_tokens,
+                lobster_micros,
                 last_economy_at: Instant::now(),
-                equipped_head: user.economy.equipped_head,
-                owned_heads: user.economy.owned_heads,
-                owned_pixels: user.economy.owned_pixels,
-                facing: 0,
-                walking_phase: 0,
+                equipped_head,
+                owned_heads,
+                owned_pixels,
+                facing,
+                walking_phase,
                 npc_movement: None,
             },
         );
         ensure_minimum_entities(&mut world);
+        replaced_save
     }
 
     async fn remove_player(&self, id: &str) -> Option<EconomySave> {
@@ -1434,7 +1622,7 @@ impl Game {
             let jump_started = input.jump && !player.input.jump;
             player.input = input;
             if jump_started && player.jump_height <= JUMP_GROUND_EPSILON {
-                player.jump_velocity = JUMP_IMPULSE_CELLS_PER_SECOND;
+                start_player_jump(player, input);
             }
         }
     }
@@ -1576,11 +1764,19 @@ async fn run_game_loop(game: GameHandle, db: PgPool) {
             }
             next_leaderboard_refresh = now + Duration::from_secs(5);
         }
-        let snapshot = {
+        let saves = {
             let mut world = game.world.lock().await;
             let dt = now.duration_since(world.last_tick).as_secs_f64().min(0.2);
             world.last_tick = now;
-            tick_world(&mut world, dt);
+            tick_world(&mut world, dt)
+        };
+        for save in saves {
+            if let Err(err) = persist_economy(&db, save).await {
+                error!("failed to persist pickup reward: {err}");
+            }
+        }
+        let snapshot = {
+            let world = game.world.lock().await;
             snapshot_world(&world, leaderboard.clone())
         };
         let _ = game.snapshots.send(snapshot);
@@ -1621,13 +1817,20 @@ const NPC_PATH_SAMPLES: usize = 32;
 const PIXEL_COLOR_COUNT: usize = 5;
 const PIXEL_PACK_SIZE: u64 = 1;
 const PIXEL_PACK_PRICE_LOBSTERS: u64 = 1_000;
+const PICKUP_SPAWN_SECONDS: u64 = 15;
+const PICKUP_TTL_SECONDS: u64 = 60;
+const PICKUP_REWARD_LOBSTERS: u64 = 100;
+const PICKUP_COLLISION_RADIANS: f64 = 0.045;
+const PICKUP_REWARD_DISPLAY_MS: u64 = 1_200;
 const LOBSTER_MICROS: u64 = 1_000_000;
-const LOBSTER_RATE_TOKEN_UNIT: u64 = 100_000_000;
-const LOBSTER_ACCRUAL_TOKEN_MS_PER_MICRO: u64 = 6_000_000;
+const LOBSTER_RATE_TOKEN_UNIT: u64 = 6_000_000;
+const LOBSTER_ACCRUAL_TOKEN_MS_PER_MICRO: u64 = 360_000;
 const JUMP_IMPULSE_CELLS_PER_SECOND: f64 = 7.6;
 const JUMP_GRAVITY_CELLS_PER_SECOND2: f64 = 19.0;
 const MAX_JUMP_HEIGHT_CELLS: f64 = 2.0;
 const JUMP_GROUND_EPSILON: f64 = 0.02;
+const JUMP_CHAIN_WINDOW: Duration = Duration::from_millis(500);
+const THIRD_MOMENTUM_JUMP_MULTIPLIER: f64 = 6.0;
 const NPC_NAMES: &[&str] = &[
     "Coco", "Lulu", "Rico", "Fifi", "Toto", "Mimi", "Pepe", "Gigi", "Bibi", "Nono", "Kiki", "Zaza",
     "Didi", "Paco", "Lola", "Nico", "Tina", "Jojo", "Pipo", "Nina", "Chico", "Mona", "Roxy",
@@ -1641,6 +1844,10 @@ const NPC_NAMES: &[&str] = &[
     "Blaise", "Gogo", "Mado", "Loulou",
 ];
 
+const PICKUP_EMOJIS: &[&str] = &[
+    "🍎", "🍌", "🍇", "🍓", "🍕", "🥐", "🥕", "🌽", "🍄", "🐟", "🐢", "🐸", "🐧", "🦊", "🐼", "🐙",
+];
+
 const MARKET_ITEMS: &[(&str, &str, &str, u64)] = &[
     ("default", "Default", "0", 0),
     ("box", "Package", "📦", 0),
@@ -1648,7 +1855,7 @@ const MARKET_ITEMS: &[(&str, &str, &str, u64)] = &[
     ("cowboy", "Cowboy", "🤠", 1_500),
     ("sunglasses", "Sunglasses", "😎", 7_500),
     ("frog", "Frog", "🐸", 25_000),
-    ("lobster", "Lobster", "🦞", 100_000),
+    ("lobster", "🦞", "🦞", 100_000),
     ("sun", "Sun", "☀️", 500_000),
 ];
 
@@ -1734,6 +1941,12 @@ fn spawn_npc(world: &mut GameWorld, rng: &mut impl Rng) {
             fake: true,
             jump_height: 0.0,
             jump_velocity: 0.0,
+            jump_momentum: None,
+            last_jump_started_at: None,
+            last_jump_momentum: None,
+            jump_leg_pose: 0,
+            momentum_jump_chain: 0,
+            jump_momentum_multiplier: 1.0,
             npc_jump_seconds: random_npc_jump_seconds(rng),
             total_tokens: 0,
             lobster_micros: 0,
@@ -1773,7 +1986,75 @@ fn random_npc_jump_seconds(rng: &mut impl Rng) -> f64 {
     rng.random_range(1.4..=5.5)
 }
 
-fn tick_world(world: &mut GameWorld, dt: f64) {
+fn start_player_jump(player: &mut Player, input: InputState) {
+    let now = Instant::now();
+    player.jump_velocity = JUMP_IMPULSE_CELLS_PER_SECOND;
+
+    let pose = jump_leg_pose_from_input(input);
+    let has_direction_input = input.up || input.down || input.left || input.right;
+    if has_direction_input {
+        player.jump_leg_pose = pose;
+        player.jump_momentum = None;
+        player.momentum_jump_chain = 1;
+        player.jump_momentum_multiplier = 1.0;
+    } else if player
+        .last_jump_started_at
+        .and_then(|started_at| now.checked_duration_since(started_at))
+        .is_some_and(|elapsed| elapsed <= JUMP_CHAIN_WINDOW)
+        && player.last_jump_momentum.is_some()
+    {
+        player.jump_momentum = player.last_jump_momentum;
+        player.momentum_jump_chain = player.momentum_jump_chain.saturating_add(1).max(1);
+        player.jump_momentum_multiplier = if player.momentum_jump_chain == 3 {
+            THIRD_MOMENTUM_JUMP_MULTIPLIER
+        } else {
+            1.0
+        };
+        if player.jump_leg_pose == 0 || player.jump_leg_pose == 1 {
+            player.jump_leg_pose = jump_leg_pose_from_momentum(player);
+        }
+    } else {
+        player.jump_momentum = None;
+        player.momentum_jump_chain = 0;
+        player.jump_momentum_multiplier = 1.0;
+        player.jump_leg_pose = if rand::rng().random_range(0..2) == 0 {
+            0
+        } else {
+            1
+        };
+    }
+
+    player.last_jump_started_at = Some(now);
+}
+
+fn jump_leg_pose_from_input(input: InputState) -> i8 {
+    let left_or_top = input.left || input.up;
+    let right_or_bottom = input.right || input.down;
+    if left_or_top && !right_or_bottom {
+        -1
+    } else if right_or_bottom && !left_or_top {
+        2
+    } else if rand::rng().random_range(0..2) == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+fn jump_leg_pose_from_momentum(player: &Player) -> i8 {
+    let Some(momentum) = player.last_jump_momentum else {
+        return player.jump_leg_pose;
+    };
+    let right = player.basis_up.cross(player.position).normalize();
+    if momentum.dot(right) < 0.0 {
+        -1
+    } else {
+        2
+    }
+}
+
+fn tick_world(world: &mut GameWorld, dt: f64) -> Vec<EconomySave> {
+    let mut saves = Vec::new();
     let economy_now = Instant::now();
     for player in world.players.values_mut().filter(|player| !player.fake) {
         accrue_lobsters(player, economy_now);
@@ -1801,21 +2082,38 @@ fn tick_world(world: &mut GameWorld, dt: f64) {
         }
         if player.input.right {
             direction = direction.add(screen_right);
-            if !player.input.left {
-                player.facing = 1;
-            }
         }
         if player.input.left {
             direction = direction.add(screen_right.scale(-1.0));
-            if !player.input.right {
-                player.facing = -1;
-            }
         }
         direction = direction.add(player.position.scale(-direction.dot(player.position)));
-        if direction.length() > 1e-6 {
+        let airborne = player.jump_height > JUMP_GROUND_EPSILON || player.jump_velocity > 0.0;
+        let movement_direction = if direction.length() > 1e-6 {
             let direction = direction.normalize();
-            let angular_distance = ANGULAR_SPEED_RADIANS_PER_SECOND * dt;
+            if airborne {
+                player.jump_momentum = Some(direction);
+                player.last_jump_momentum = Some(direction);
+            }
+            Some(direction)
+        } else if airborne {
+            player.jump_momentum.map(|momentum| {
+                momentum
+                    .add(player.position.scale(-momentum.dot(player.position)))
+                    .normalize()
+            })
+        } else {
+            player.jump_momentum = None;
+            None
+        };
+        if let Some(direction) = movement_direction.filter(|direction| direction.length() > 1e-6) {
+            let movement_multiplier = if airborne && player.jump_momentum.is_some() {
+                player.jump_momentum_multiplier
+            } else {
+                1.0
+            };
+            let angular_distance = ANGULAR_SPEED_RADIANS_PER_SECOND * dt * movement_multiplier;
             let rotation_axis = player.position.cross(direction).normalize();
+            let previous_position = player.position;
             player.position = player
                 .position
                 .rotate_around(rotation_axis, angular_distance)
@@ -1827,6 +2125,7 @@ fn tick_world(world: &mut GameWorld, dt: f64) {
             player.basis_up = transported_up
                 .add(player.position.scale(-transported_up.dot(player.position)))
                 .normalize();
+            update_facing_from_movement(player, previous_position, player.position);
             player.walking_phase = player.walking_phase.wrapping_add(1);
         }
     }
@@ -1837,6 +2136,81 @@ fn tick_world(world: &mut GameWorld, dt: f64) {
         tick_jump(player, dt);
         tick_npc(player, dt, &mut rng);
     }
+    tick_pickups(world, economy_now, &mut rng, &mut saves);
+    saves
+}
+
+fn tick_pickups(
+    world: &mut GameWorld,
+    now: Instant,
+    rng: &mut impl Rng,
+    saves: &mut Vec<EconomySave>,
+) {
+    world.pickups.retain(|_, pickup| pickup.expires_at > now);
+    world
+        .pickup_rewards
+        .retain(|reward| reward.expires_at > now);
+
+    if now.duration_since(world.last_pickup_spawn) >= Duration::from_secs(PICKUP_SPAWN_SECONDS) {
+        let active_players = world.players.values().filter(|player| !player.fake).count();
+        let spawn_count = (active_players as f64).sqrt().ceil() as usize;
+        for _ in 0..spawn_count {
+            spawn_pickup(world, now, rng);
+        }
+        world.last_pickup_spawn = now;
+    }
+
+    let mut collected = Vec::new();
+    for (pickup_id, pickup) in &world.pickups {
+        if let Some(player) = world
+            .players
+            .values_mut()
+            .filter(|player| !player.fake)
+            .find(|player| player.position.angle_to(pickup.position) <= PICKUP_COLLISION_RADIANS)
+        {
+            player.lobster_micros = player
+                .lobster_micros
+                .saturating_add(PICKUP_REWARD_LOBSTERS.saturating_mul(LOBSTER_MICROS));
+            if let Some(save) = economy_save(player) {
+                saves.push(save);
+            }
+            world.pickup_rewards.push(PickupReward {
+                player_id: player.id.clone(),
+                lobsters: PICKUP_REWARD_LOBSTERS,
+                expires_at: now + Duration::from_millis(PICKUP_REWARD_DISPLAY_MS),
+            });
+            collected.push(*pickup_id);
+        }
+    }
+    for pickup_id in collected {
+        world.pickups.remove(&pickup_id);
+    }
+}
+
+fn spawn_pickup(world: &mut GameWorld, now: Instant, rng: &mut impl Rng) {
+    let id = world.next_pickup_id;
+    world.next_pickup_id = world.next_pickup_id.wrapping_add(1);
+    let emoji = PICKUP_EMOJIS[rng.random_range(0..PICKUP_EMOJIS.len())];
+    world.pickups.insert(
+        id,
+        Pickup {
+            id,
+            position: Vec3::random_unit(rng),
+            emoji,
+            expires_at: now + Duration::from_secs(PICKUP_TTL_SECONDS),
+        },
+    );
+}
+
+fn economy_save(player: &Player) -> Option<EconomySave> {
+    player.user_id.map(|user_id| EconomySave {
+        user_id,
+        total_tokens: player.total_tokens,
+        lobster_micros: player.lobster_micros,
+        equipped_head: player.equipped_head.clone(),
+        owned_heads: player.owned_heads.clone(),
+        owned_pixels: player.owned_pixels,
+    })
 }
 
 fn tick_npc_jump(player: &mut Player, dt: f64, rng: &mut impl Rng) {
@@ -1844,6 +2218,10 @@ fn tick_npc_jump(player: &mut Player, dt: f64, rng: &mut impl Rng) {
     if player.npc_jump_seconds <= 0.0 {
         if player.jump_height <= JUMP_GROUND_EPSILON {
             player.jump_velocity = JUMP_IMPULSE_CELLS_PER_SECOND;
+            player.last_jump_started_at = Some(Instant::now());
+            player.momentum_jump_chain = 0;
+            player.jump_momentum_multiplier = 1.0;
+            player.jump_leg_pose = if rng.random_range(0..2) == 0 { 0 } else { 1 };
         }
         player.npc_jump_seconds = random_npc_jump_seconds(rng);
     }
@@ -1853,6 +2231,8 @@ fn tick_jump(player: &mut Player, dt: f64) {
     if player.jump_height <= 0.0 && player.jump_velocity <= 0.0 {
         player.jump_height = 0.0;
         player.jump_velocity = 0.0;
+        player.jump_momentum = None;
+        player.jump_momentum_multiplier = 1.0;
         return;
     }
 
@@ -1867,6 +2247,8 @@ fn tick_jump(player: &mut Player, dt: f64) {
     if player.jump_height <= 0.0 {
         player.jump_height = 0.0;
         player.jump_velocity = 0.0;
+        player.jump_momentum = None;
+        player.jump_momentum_multiplier = 1.0;
     }
 }
 
@@ -1974,6 +2356,7 @@ fn move_player_to_position(player: &mut Player, next_position: Vec3) {
         player.position = next_position;
         return;
     }
+    let previous_position = player.position;
     let rotation_axis = player.position.cross(next_position).normalize();
     player.position = next_position.normalize();
     let transported_up = player
@@ -1983,6 +2366,23 @@ fn move_player_to_position(player: &mut Player, next_position: Vec3) {
     player.basis_up = transported_up
         .add(player.position.scale(-transported_up.dot(player.position)))
         .normalize();
+    update_facing_from_movement(player, previous_position, player.position);
+}
+
+fn update_facing_from_movement(player: &mut Player, previous_position: Vec3, next_position: Vec3) {
+    let delta = next_position.add(previous_position.scale(-1.0));
+    let movement = delta.add(next_position.scale(-delta.dot(next_position)));
+    if movement.length() <= 1e-9 {
+        return;
+    }
+
+    let local_right = player.basis_up.cross(next_position).normalize();
+    let right_amount = movement.normalize().dot(local_right);
+    if right_amount > 0.15 {
+        player.facing = 1;
+    } else if right_amount < -0.15 {
+        player.facing = -1;
+    }
 }
 
 fn snapshot_world(world: &GameWorld, leaderboard: Vec<LeaderboardEntry>) -> Snapshot {
@@ -2006,17 +2406,37 @@ fn snapshot_world(world: &GameWorld, leaderboard: Vec<LeaderboardEntry>) -> Snap
                 owned_heads: player.owned_heads.clone(),
                 owned_pixels: player.owned_pixels,
                 jump_height: player.jump_height,
+                jump_leg_pose: player.jump_leg_pose,
                 facing: player.facing,
                 walking_phase: player.walking_phase,
             }
         })
         .collect();
     let placed_pixels = world.placed_pixels.values().cloned().collect();
+    let pickups = world
+        .pickups
+        .values()
+        .map(|pickup| PickupSnapshot {
+            id: pickup.id,
+            position: pickup.position.to_array(),
+            emoji: pickup.emoji.to_string(),
+        })
+        .collect();
+    let pickup_rewards = world
+        .pickup_rewards
+        .iter()
+        .map(|reward| PickupRewardSnapshot {
+            player_id: reward.player_id.clone(),
+            lobsters: reward.lobsters,
+        })
+        .collect();
     Snapshot {
         server_time_ms: 0,
         players,
         leaderboard,
         placed_pixels,
+        pickups,
+        pickup_rewards,
         economy_rules: EconomyRulesSnapshot {
             lobster_rate_token_unit: LOBSTER_RATE_TOKEN_UNIT,
         },
@@ -2122,8 +2542,8 @@ mod tests {
 
     #[test]
     fn lobster_income_uses_current_market_rate() {
-        assert_eq!(LOBSTER_RATE_TOKEN_UNIT, 100_000_000);
-        assert_eq!(LOBSTER_ACCRUAL_TOKEN_MS_PER_MICRO, 6_000_000);
+        assert_eq!(LOBSTER_RATE_TOKEN_UNIT, 6_000_000);
+        assert_eq!(LOBSTER_ACCRUAL_TOKEN_MS_PER_MICRO, 360_000);
 
         let position = Vec3::new(1.0, 0.0, 0.0);
         let now = Instant::now();
@@ -2139,10 +2559,16 @@ mod tests {
             fake: false,
             jump_height: 0.0,
             jump_velocity: 0.0,
+            jump_momentum: None,
+            last_jump_started_at: None,
+            last_jump_momentum: None,
+            jump_leg_pose: 0,
+            momentum_jump_chain: 0,
+            jump_momentum_multiplier: 1.0,
             npc_jump_seconds: 0.0,
-            total_tokens: 100_000_000,
+            total_tokens: 1_000_000,
             lobster_micros: 0,
-            last_economy_at: now - Duration::from_secs(60),
+            last_economy_at: now - Duration::from_secs(60 * 60),
             equipped_head: "default".to_string(),
             owned_heads: vec!["default".to_string()],
             owned_pixels: [0; PIXEL_COLOR_COUNT],
@@ -2153,7 +2579,7 @@ mod tests {
 
         accrue_lobsters(&mut player, now);
 
-        assert_eq!(lobster_balance(player.lobster_micros), 1);
+        assert_eq!(lobster_balance(player.lobster_micros), 10);
     }
 
     #[test]
@@ -2181,6 +2607,12 @@ mod tests {
                     fake: false,
                     jump_height: 0.0,
                     jump_velocity: 0.0,
+                    jump_momentum: None,
+                    last_jump_started_at: None,
+                    last_jump_momentum: None,
+                    jump_leg_pose: 0,
+                    momentum_jump_chain: 0,
+                    jump_momentum_multiplier: 1.0,
                     npc_jump_seconds: 0.0,
                     total_tokens: 0,
                     lobster_micros: 0,
@@ -2196,6 +2628,10 @@ mod tests {
             next_npc_id: 0,
             last_tick: Instant::now(),
             placed_pixels: HashMap::new(),
+            pickups: HashMap::new(),
+            pickup_rewards: Vec::new(),
+            next_pickup_id: 0,
+            last_pickup_spawn: Instant::now(),
         };
 
         for _ in 0..500 {
@@ -2271,6 +2707,151 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reconnect_replaces_existing_player_for_same_user() {
+        let game = Game::new();
+        let user_id = Uuid::new_v4();
+        let user = GameUser {
+            id: user_id,
+            username: "real".to_string(),
+            economy: UserEconomy {
+                total_tokens: 0,
+                lobster_micros: 0,
+                equipped_head: "default".to_string(),
+                owned_heads: vec!["default".to_string()],
+                owned_pixels: [0; PIXEL_COLOR_COUNT],
+            },
+            rewards: Vec::new(),
+        };
+
+        game.add_player("old-session".to_string(), user.clone())
+            .await;
+        {
+            let mut world = game.world.lock().await;
+            let player = world.players.get_mut("old-session").unwrap();
+            player.position = Vec3::new(1.0, 0.0, 0.0);
+            player.basis_up = Vec3::new(0.0, 0.0, 1.0);
+            player.total_tokens = 42;
+        }
+
+        let save = game.add_player("new-session".to_string(), user).await;
+
+        let world = game.world.lock().await;
+        assert!(save.is_some());
+        assert!(!world.players.contains_key("old-session"));
+        assert!(world.players.contains_key("new-session"));
+        assert_eq!(
+            world
+                .players
+                .values()
+                .filter(|player| !player.fake && player.user_id == Some(user_id))
+                .count(),
+            1
+        );
+        let player = world.players.get("new-session").unwrap();
+        assert!(player.position.angle_to(Vec3::new(1.0, 0.0, 0.0)) < 1e-9);
+        assert_eq!(player.total_tokens, 42);
+    }
+
+    #[test]
+    fn movement_updates_facing_in_local_tangent_frame() {
+        let position = Vec3::new(1.0, 0.0, 0.0);
+        let mut player = Player {
+            id: "player".to_string(),
+            user_id: None,
+            last_seen: Instant::now(),
+            name: "player".to_string(),
+            planet_id: 0,
+            position,
+            basis_up: Vec3::new(0.0, 0.0, 1.0),
+            input: InputState::default(),
+            fake: false,
+            jump_height: 0.0,
+            jump_velocity: 0.0,
+            jump_momentum: None,
+            last_jump_started_at: None,
+            last_jump_momentum: None,
+            jump_leg_pose: 0,
+            momentum_jump_chain: 0,
+            jump_momentum_multiplier: 1.0,
+            npc_jump_seconds: 0.0,
+            total_tokens: 0,
+            lobster_micros: 0,
+            last_economy_at: Instant::now(),
+            equipped_head: "default".to_string(),
+            owned_heads: vec!["default".to_string()],
+            owned_pixels: [0; PIXEL_COLOR_COUNT],
+            facing: 0,
+            walking_phase: 0,
+            npc_movement: None,
+        };
+
+        update_facing_from_movement(&mut player, position, Vec3::new(1.0, 0.2, 0.0).normalize());
+        assert_eq!(player.facing, 1);
+
+        update_facing_from_movement(&mut player, position, Vec3::new(1.0, -0.2, 0.0).normalize());
+        assert_eq!(player.facing, -1);
+    }
+
+    #[test]
+    fn third_chained_momentum_jump_uses_fast_multiplier() {
+        let position = Vec3::new(1.0, 0.0, 0.0);
+        let mut player = Player {
+            id: "player".to_string(),
+            user_id: None,
+            last_seen: Instant::now(),
+            name: "player".to_string(),
+            planet_id: 0,
+            position,
+            basis_up: Vec3::new(0.0, 0.0, 1.0),
+            input: InputState::default(),
+            fake: false,
+            jump_height: 0.0,
+            jump_velocity: 0.0,
+            jump_momentum: None,
+            last_jump_started_at: None,
+            last_jump_momentum: None,
+            jump_leg_pose: 0,
+            momentum_jump_chain: 0,
+            jump_momentum_multiplier: 1.0,
+            npc_jump_seconds: 0.0,
+            total_tokens: 0,
+            lobster_micros: 0,
+            last_economy_at: Instant::now(),
+            equipped_head: "default".to_string(),
+            owned_heads: vec!["default".to_string()],
+            owned_pixels: [0; PIXEL_COLOR_COUNT],
+            facing: 0,
+            walking_phase: 0,
+            npc_movement: None,
+        };
+        let momentum = Vec3::new(0.0, 1.0, 0.0);
+
+        start_player_jump(
+            &mut player,
+            InputState {
+                right: true,
+                ..InputState::default()
+            },
+        );
+        player.last_jump_momentum = Some(momentum);
+        player.jump_height = 0.0;
+        player.jump_velocity = 0.0;
+
+        start_player_jump(&mut player, InputState::default());
+        assert_eq!(player.momentum_jump_chain, 2);
+        assert_eq!(player.jump_momentum_multiplier, 1.0);
+        player.jump_height = 0.0;
+        player.jump_velocity = 0.0;
+
+        start_player_jump(&mut player, InputState::default());
+        assert_eq!(player.momentum_jump_chain, 3);
+        assert_eq!(
+            player.jump_momentum_multiplier,
+            THIRD_MOMENTUM_JUMP_MULTIPLIER
+        );
+    }
+
     #[test]
     fn npc_leaves_idle_and_walks_on_unit_sphere() {
         let position = Vec3::new(1.0, 0.0, 0.0);
@@ -2289,6 +2870,12 @@ mod tests {
                     fake: true,
                     jump_height: 0.0,
                     jump_velocity: 0.0,
+                    jump_momentum: None,
+                    last_jump_started_at: None,
+                    last_jump_momentum: None,
+                    jump_leg_pose: 0,
+                    momentum_jump_chain: 0,
+                    jump_momentum_multiplier: 1.0,
                     npc_jump_seconds: 0.0,
                     total_tokens: 0,
                     lobster_micros: 0,
@@ -2306,6 +2893,10 @@ mod tests {
             next_npc_id: 0,
             last_tick: Instant::now(),
             placed_pixels: HashMap::new(),
+            pickups: HashMap::new(),
+            pickup_rewards: Vec::new(),
+            next_pickup_id: 0,
+            last_pickup_spawn: Instant::now(),
         };
 
         for _ in 0..120 {
