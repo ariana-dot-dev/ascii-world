@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    f64::consts::{FRAC_PI_2, TAU},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -35,6 +36,12 @@ impl Vec3 {
 
     pub fn new(x: f64, y: f64, z: f64) -> Self {
         Self { x, y, z }
+    }
+
+    pub fn from_lat_lon(lat: f64, lon: f64) -> Self {
+        let lat = lat.clamp(-FRAC_PI_2, FRAC_PI_2);
+        let cos_lat = lat.cos();
+        Self::new(cos_lat * lon.cos(), cos_lat * lon.sin(), lat.sin())
     }
 
     pub fn from_array(value: [f64; 3]) -> Option<Self> {
@@ -100,6 +107,26 @@ pub fn stable_camera_up(focus: Vec3) -> Vec3 {
         let east = Vec3::new(0.0, 1.0, 0.0);
         east.add(focus.scale(-east.dot(focus))).normalize()
     }
+}
+
+pub fn orbit_camera(elapsed_seconds: f64) -> (Vec3, Vec3) {
+    let seconds = if elapsed_seconds.is_finite() {
+        elapsed_seconds.max(0.0)
+    } else {
+        0.0
+    };
+    let longitude = seconds * TAU / 96.0;
+    let latitude = 0.18 * (seconds * TAU / 64.0).sin();
+    let focus = Vec3::from_lat_lon(latitude, longitude).normalize();
+    (focus, stable_camera_up(focus))
+}
+
+pub fn orbit_camera_now() -> (Vec3, Vec3) {
+    let elapsed_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .unwrap_or(0.0);
+    orbit_camera(elapsed_seconds)
 }
 
 pub fn equipped_head_glyph(id: &str) -> &str {
@@ -903,5 +930,27 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
         } else {
             frame.text(label_x, body_y - 3, &label, HUD);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orbit_camera_stays_on_unit_sphere_with_tangent_up() {
+        let (focus, up) = orbit_camera(12.0);
+
+        assert!((focus.length() - 1.0).abs() < 1e-9);
+        assert!((up.length() - 1.0).abs() < 1e-9);
+        assert!(focus.dot(up).abs() < 1e-9);
+    }
+
+    #[test]
+    fn orbit_camera_moves_around_equator_over_time() {
+        let (start, _) = orbit_camera(0.0);
+        let (half_orbit, _) = orbit_camera(48.0);
+
+        assert!(start.dot(half_orbit) < -0.9);
     }
 }

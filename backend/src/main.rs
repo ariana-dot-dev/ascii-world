@@ -1023,11 +1023,13 @@ async fn landing_page() -> Response {
 * { box-sizing: border-box; }
 html, body { margin: 0; min-height: 100%; background: #1e1e1e; color: #cccccc; }
 body {
+  --earth-x: 0ch;
+  --earth-y: 0em;
   position: relative;
   isolation: isolate;
   display: grid;
   grid-template-rows: 1fr auto;
-  place-items: center;
+  place-items: center start;
   min-height: 100svh;
   padding: 2ch;
   font-family: "Lilex Mono", "Lilex Nerd Font Mono", "Lilex", ui-monospace, monospace;
@@ -1040,8 +1042,10 @@ body {
 .ascii-sky {
   position: fixed;
   inset: 0;
-  z-index: 0;
+  z-index: -1;
   margin: 0;
+  opacity: .7;
+  transform: translate(var(--earth-x), var(--earth-y));
   color: #3f4658;
   background: #1e1e1e;
   font: inherit;
@@ -1054,6 +1058,24 @@ body {
   user-select: none;
   overflow: hidden;
 }
+.ascii-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  margin: 0;
+  color: transparent;
+  background: transparent;
+  font: inherit;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1;
+  letter-spacing: 0;
+  white-space: pre;
+  pointer-events: none;
+  user-select: none;
+  overflow: hidden;
+}
+.ascii-mask .m { background: #1e1e1e; }
 .ascii-sky .s0 { color: #465064; }
 .ascii-sky .s1 { color: #6f7d98; }
 .ascii-sky .s2 { color: #d4d4d4; }
@@ -1077,8 +1099,10 @@ body {
   display: grid;
   place-items: center;
   padding: 0;
+  margin-inline: auto;
 }
 .term {
+  position: relative;
   width: min(100%, 72ch);
   padding: 0;
   background: transparent;
@@ -1087,16 +1111,16 @@ body {
   text-align: center;
   line-height: inherit;
 }
-.term, .footer {
-  text-shadow:
-    -1ch 0 #1e1e1e, 1ch 0 #1e1e1e,
-    -2ch 0 #1e1e1e, 2ch 0 #1e1e1e,
-    0 -1em #1e1e1e, 0 1em #1e1e1e,
-    0 -2em #1e1e1e, 0 2em #1e1e1e,
-    -1ch -1em #1e1e1e, 1ch -1em #1e1e1e,
-    -1ch 1em #1e1e1e, 1ch 1em #1e1e1e,
-    -2ch -1em #1e1e1e, 2ch -1em #1e1e1e,
-    -2ch 1em #1e1e1e, 2ch 1em #1e1e1e;
+.wordmark-wrap,
+.dim,
+.cmd,
+.toggle,
+.palette,
+.footer {
+  background: transparent;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  box-shadow: none;
 }
 .title { color: #569cd6; font: inherit; font-weight: 400; letter-spacing: 0; }
 .wordmark {
@@ -1128,6 +1152,7 @@ body {
   animation: wordmark-shine 4.2s linear infinite;
 }
 .dim { color: #858585; }
+.tagline { color: #569cd6; }
 .cmd {
   display: block;
   width: 100%;
@@ -1144,7 +1169,7 @@ body {
   display: inline-grid;
   grid-auto-flow: column;
   gap: 2ch;
-  margin: 1rem 0 .4rem;
+  margin: .35rem 0 .4rem;
 }
 button {
   appearance: none;
@@ -1165,11 +1190,16 @@ button[aria-pressed="true"]::before,
 button[aria-pressed="true"]::after { color: #569cd6; }
 button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
 .palette {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
   display: inline-grid;
   grid-template-columns: repeat(8, 3ch);
   grid-template-rows: repeat(2, 1em);
   gap: 0;
-  margin-top: 1.45em;
+  margin: 0;
+  opacity: .7;
   line-height: 1;
   font-style: normal;
 }
@@ -1201,11 +1231,45 @@ button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
   z-index: 10;
   color: #858585;
   text-align: center;
+  padding-right: 26ch;
 }
 .footer a {
   color: #569cd6;
   text-decoration: underline;
   text-underline-offset: .18em;
+}
+@media (max-width: 700px) {
+  body {
+    --earth-x: 0ch;
+    --earth-y: 10em;
+    place-items: start center;
+    padding-top: max(4em, env(safe-area-inset-top));
+  }
+  .screen {
+    margin-inline: auto;
+  }
+}
+@media (min-width: 1000px) {
+  body {
+    --earth-x: 22ch;
+    --earth-y: 0em;
+    place-items: center start;
+    padding-left: 7vw;
+  }
+  .screen {
+    width: min(52vw, 76ch);
+    margin-inline: 0;
+  }
+}
+@media (min-width: 701px) and (max-width: 999px) {
+  body {
+    --earth-x: 0ch;
+    --earth-y: 0em;
+    place-items: center;
+  }
+  .screen {
+    margin-inline: auto;
+  }
 }
 @keyframes wordmark-shine {
   0%, 24% { clip-path: inset(0 100% 0 0); }
@@ -1217,6 +1281,7 @@ button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
 </head>
 <body>
 <pre id="ascii-sky" class="ascii-sky" aria-hidden="true"></pre>
+<pre id="ascii-mask" class="ascii-mask" aria-hidden="true"></pre>
 <span id="cell-probe" class="cell-probe" aria-hidden="true">M</span>
 <main class="screen">
 <section class="term" aria-label="Ascii World landing page">
@@ -1230,7 +1295,8 @@ button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
   / __ |(_-&lt;/ __/ / /  | |/ |/ / _ \/ __/ / _  / 
 /_/ |_/___/\__/_/_/   |__/|__/\___/_/ /_/\_,_/</pre>
 </div>
-<div class="dim">The idle multiplayer game for vibe coders</div>
+<div class="dim tagline">The idle multiplayer game for vibe coders</div>
+<div class="dim">join from your terminal:</div>
 <div class="toggle" role="group" aria-label="platform">
 <button type="button" data-platform="mac" aria-pressed="false" aria-label="macOS">🍎</button>
 <button type="button" data-platform="linux" aria-pressed="true" aria-label="Linux">🐧</button>
@@ -1239,18 +1305,20 @@ button:focus-visible { outline: 1px solid #569cd6; outline-offset: 2px; }
 <code id="install" class="cmd"></code>
 <div class="dim">once installed, run:</div>
 <code id="run" class="cmd"></code>
+</section>
+</main>
+<footer class="footer">Made and hosted by agents on <a href="https://box.ascii.dev">box.ascii.dev</a>, the cheapest and most powerful AI sandboxes</footer>
 <div class="palette" aria-label="Dark+ terminal colors">
 <span class="swatch c0">###</span><span class="swatch c1">###</span><span class="swatch c2">###</span><span class="swatch c3">###</span><span class="swatch c4">###</span><span class="swatch c5">###</span><span class="swatch c6">###</span><span class="swatch c7">###</span>
 <span class="swatch c8">###</span><span class="swatch c9">###</span><span class="swatch c10">###</span><span class="swatch c11">###</span><span class="swatch c12">###</span><span class="swatch c13">###</span><span class="swatch c14">###</span><span class="swatch c15">###</span>
 </div>
-</section>
-</main>
-<footer class="footer">Made and hosted by agents on <a href="https://box.ascii.dev">box.ascii.dev</a>, the cheapest and most powerful AI sandboxes</footer>
 <script>
 const sky = document.getElementById("ascii-sky");
+const mask = document.getElementById("ascii-mask");
 const probe = document.getElementById("cell-probe");
-let skySize = { cols: 0, rows: 0 };
+let skySize = { cols: 0, rows: 0, cellW: 1, cellH: 1 };
 let lastSkyFrame = 0;
+let maskQueued = false;
 
 function hash2(x, y, seed) {
   let value = ((x * 0x8da6b343) ^ (y * 0xd8163841) ^ seed) >>> 0;
@@ -1373,11 +1441,116 @@ function skyCell(x, y, time) {
 function measureSky() {
   const rect = probe.getBoundingClientRect();
   const cellW = Math.max(1, rect.width);
-  const cellH = Math.max(1, rect.height);
+  const measuredCellH = Math.max(1, rect.height);
+  const cellH = Math.max(measuredCellH, cellW * 2);
   skySize = {
     cols: Math.ceil(window.innerWidth / cellW),
-    rows: Math.ceil(window.innerHeight / cellH)
+    rows: Math.ceil(window.innerHeight / cellH),
+    cellW,
+    cellH
   };
+  sky.style.lineHeight = `${cellH}px`;
+  mask.style.lineHeight = `${cellH}px`;
+}
+
+function foregroundTextNodes() {
+  const roots = Array.from(document.querySelectorAll(".screen, .footer"));
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !/\S/.test(node.nodeValue)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      if (!roots.some(root => root.contains(node.parentElement))) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      const style = window.getComputedStyle(node.parentElement);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  const nodes = [];
+  while (walker.nextNode()) {
+    nodes.push(walker.currentNode);
+  }
+  return nodes;
+}
+
+function markMask(maskCells, col, row) {
+  for (let dy = -2; dy <= 2; dy++) {
+    const yy = row + dy;
+    if (yy < 0 || yy >= skySize.rows) {
+      continue;
+    }
+    for (let dx = -2; dx <= 2; dx++) {
+      const xx = col + dx;
+      if (xx >= 0 && xx < skySize.cols) {
+        maskCells[yy * skySize.cols + xx] = true;
+      }
+    }
+  }
+}
+
+function renderForegroundMask() {
+  maskQueued = false;
+  if (skySize.cols <= 0 || skySize.rows <= 0) {
+    measureSky();
+  }
+  const maskCells = new Array(skySize.cols * skySize.rows).fill(false);
+  for (const node of foregroundTextNodes()) {
+    const text = node.nodeValue;
+    for (let index = 0; index < text.length;) {
+      const glyph = Array.from(text.slice(index))[0];
+      if (glyph === " " || glyph === "\n" || glyph === "\t" || glyph === "\r") {
+        index += glyph.length;
+        continue;
+      }
+      const range = document.createRange();
+      range.setStart(node, index);
+      range.setEnd(node, index + glyph.length);
+      for (const rect of range.getClientRects()) {
+        if (rect.width <= 0 || rect.height <= 0) {
+          continue;
+        }
+        const col = Math.floor((rect.left + rect.width / 2) / skySize.cellW);
+        const row = Math.floor((rect.top + rect.height / 2) / skySize.cellH);
+        markMask(maskCells, col, row);
+      }
+      range.detach();
+      index += glyph.length;
+    }
+  }
+
+  const lines = [];
+  for (let row = 0; row < skySize.rows; row++) {
+    let line = "";
+    let inMask = false;
+    for (let col = 0; col < skySize.cols; col++) {
+      const filled = maskCells[row * skySize.cols + col];
+      if (filled && !inMask) {
+        line += `<span class="m">`;
+        inMask = true;
+      } else if (!filled && inMask) {
+        line += `</span>`;
+        inMask = false;
+      }
+      line += " ";
+    }
+    if (inMask) {
+      line += `</span>`;
+    }
+    lines.push(line);
+  }
+  mask.innerHTML = lines.join("\n");
+}
+
+function queueForegroundMask() {
+  if (maskQueued) {
+    return;
+  }
+  maskQueued = true;
+  requestAnimationFrame(renderForegroundMask);
 }
 
 async function renderSky(now) {
@@ -1405,22 +1578,24 @@ async function renderSky(now) {
 window.addEventListener("resize", () => {
   measureSky();
   lastSkyFrame = 0;
+  queueForegroundMask();
 });
 measureSky();
+queueForegroundMask();
 requestAnimationFrame(renderSky);
 
-const origin = window.location.origin;
+const installOrigin = "https://world.ascii.dev";
 const commands = {
   mac: {
-    install: `curl -fsSL ${origin}/install.sh | sh`,
+    install: `curl -fsSL ${installOrigin}/install.sh | sh`,
     run: `world`
   },
   linux: {
-    install: `curl -fsSL ${origin}/install.sh | sh`,
+    install: `curl -fsSL ${installOrigin}/install.sh | sh`,
     run: `world`
   },
   windows: {
-    install: `powershell -ExecutionPolicy Bypass -c "irm ${origin}/install.ps1 | iex"`,
+    install: `powershell -ExecutionPolicy Bypass -c "irm ${installOrigin}/install.ps1 | iex"`,
     run: `world`
   }
 };
@@ -1432,6 +1607,7 @@ function pick(platform) {
   }
   install.textContent = commands[platform].install;
   run.textContent = commands[platform].run;
+  queueForegroundMask();
 }
 for (const button of document.querySelectorAll("button[data-platform]")) {
   button.addEventListener("click", () => pick(button.dataset.platform));
@@ -1513,8 +1689,7 @@ fn render_spectator_frame_html(snapshot: &Snapshot, width: u16, height: u16) -> 
                 *rewards.entry(reward.player_id.as_str()).or_default() += reward.lobsters;
                 rewards
             });
-    let camera_focus = world_render::Vec3::X;
-    let camera_up = world_render::stable_camera_up(camera_focus);
+    let (camera_focus, camera_up) = world_render::orbit_camera_now();
     let players = snapshot
         .players
         .iter()
