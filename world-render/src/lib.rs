@@ -904,27 +904,32 @@ fn draw_player(frame: &mut FrameBuffer, x: i32, y: i32, player: &VisiblePlayer) 
         } else {
             player.equipped_head.clone()
         };
+        let combat_head_x = if facing_right && !head.is_ascii() {
+            x - 1
+        } else {
+            x
+        };
         let rows = if player.punching && facing_right {
             [
-                (0, x, head.clone()),
+                (0, combat_head_x, head.clone()),
                 (1, x, "L/->".to_string()),
-                (1, x, "/ |".to_string()),
+                (2, x, "/ |".to_string()),
             ]
         } else if player.punching {
             [
-                (0, x, head.clone()),
+                (0, combat_head_x, head.clone()),
                 (1, x - 3, "<-\\J".to_string()),
                 (2, x - 1, "| \\".to_string()),
             ]
         } else if facing_right {
             [
-                (0, x, head.clone()),
+                (0, combat_head_x, head.clone()),
                 (1, x - 1, "L/L".to_string()),
                 (2, x - 1, "/ \\".to_string()),
             ]
         } else {
             [
-                (0, x, head),
+                (0, combat_head_x, head),
                 (1, x - 1, "J\\J".to_string()),
                 (2, x - 1, "/ \\".to_string()),
             ]
