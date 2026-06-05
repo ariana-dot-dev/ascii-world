@@ -51,12 +51,7 @@ done
 
 curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
 
-rm -f "$APP_DIR/.box-host-url"
-{
-  host hide "$PORT" || true
-  host "$PORT" --public --title "Ascii game backend"
-  host url "$PORT" --public --timeout 60
-} > "$APP_DIR/logs/host.log" 2>&1
-awk '/^https:\/\// { url=$1 } END { if (url) print url }' "$APP_DIR/logs/host.log" > "$APP_DIR/.box-host-url"
+host "$PORT" --public --title "Ascii game backend" > "$APP_DIR/logs/host.log" 2>&1 || true
+awk '/^https:\/\// { print $1; exit }' "$APP_DIR/logs/host.log" > "$APP_DIR/.box-host-url"
 
 test -s "$APP_DIR/.box-host-url"

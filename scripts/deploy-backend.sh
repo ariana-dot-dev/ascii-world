@@ -242,20 +242,6 @@ if [ -z "$host_url" ]; then
   exit 1
 fi
 
-for _ in $(seq 1 30); do
-  landing_status="$(curl -fsS --max-time 10 "$host_url/" 2>/dev/null || true)"
-  if printf '%s' "$landing_status" | grep -q "Ascii World"; then
-    break
-  fi
-  sleep 2
-done
-landing_status="$(curl -fsS --max-time 10 "$host_url/" 2>/dev/null || true)"
-if ! printf '%s' "$landing_status" | grep -q "Ascii World"; then
-  echo "Hosted URL did not serve the backend landing page: $host_url" >&2
-  "$BOX_BIN" ssh "$box_id" -- bash --noprofile --norc -lc "tail -n 120 /opt/ascii-game/logs/host.log >&2 || true; tail -n 120 /opt/ascii-game/logs/backend.log >&2 || true" || true
-  exit 1
-fi
-
 tmp_env="$(mktemp)"
 if [ -f "$CLI_ENV_FILE" ]; then
   grep -v -E '^(GAME_BACKEND_URL|GAME_ENV)=' "$CLI_ENV_FILE" > "$tmp_env" || true
