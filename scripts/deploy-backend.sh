@@ -233,6 +233,8 @@ chmod +x scripts/remote-run-backend.sh
 export X_CLIENT_ID=$(shell_quote "${X_CLIENT_ID:-${X_CONSUMER_KEY:-}}")
 export X_CLIENT_SECRET=$(shell_quote "${X_CLIENT_SECRET:-${X_CONSUMER_SECRET:-}}")
 export X_BEARER_TOKEN=$(shell_quote "${X_BEARER_TOKEN:-}")
+export X_REDIRECT_URI=$(shell_quote "${X_REDIRECT_URI:-}")
+export GAME_PUBLIC_URL=$(shell_quote "${GAME_PUBLIC_URL:-}")
 RESET_DB=$RESET_DB PORT=$PORT ./scripts/remote-run-backend.sh
 EOF
 
