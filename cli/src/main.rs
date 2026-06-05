@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
 enum ClientPhase {
     Onboarding,
     XLoginPending {
+        login_url: String,
         poll_token: String,
         next_poll: Instant,
     },
@@ -329,6 +330,7 @@ async fn run_client(
                             let start = start_x_login(&backend_url).await?;
                             let _ = webbrowser::open(&start.login_url);
                             phase = ClientPhase::XLoginPending {
+                                login_url: start.login_url,
                                 poll_token: start.poll_token,
                                 next_poll: Instant::now(),
                             };
@@ -442,6 +444,7 @@ async fn run_client(
         if let ClientPhase::XLoginPending {
             ref poll_token,
             ref mut next_poll,
+            ..
         } = phase
         {
             if Instant::now() >= *next_poll {
@@ -569,7 +572,9 @@ async fn run_client(
                 None
             };
             let transient_panel = match &phase {
-                ClientPhase::XLoginPending { .. } => Some(UiPanel::x_login_pending()),
+                ClientPhase::XLoginPending { login_url, .. } => {
+                    Some(UiPanel::x_login_pending(login_url))
+                }
                 ClientPhase::Welcome { .. } => {
                     let name = state
                         .x_username
@@ -1784,7 +1789,7 @@ impl UiPanel {
         }
     }
 
-    fn x_login_pending() -> Self {
+    fn x_login_pending(login_url: &str) -> Self {
         Self {
             title: "Connect your player profile".to_string(),
             blocks: vec![UiBlock::Paragraph {
@@ -1792,6 +1797,8 @@ impl UiPanel {
                 lines: vec![
                     "A browser window opened for X login.".to_string(),
                     "Complete the login there, then return to this terminal.".to_string(),
+                    "If it did not open, use this link:".to_string(),
+                    login_url.to_string(),
                 ],
             }],
             prompt: Some("Finish login in your browser, or press Escape to quit.".to_string()),
