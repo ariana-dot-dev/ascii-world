@@ -495,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
         .execute(&db)
         .await
         .context("failed to record server boot")?;
+    close_stale_player_sessions_on_boot(&db, boot_id).await?;
 
     let game = Game::new();
     tokio::spawn(run_game_loop(game.clone(), db.clone()));
@@ -1773,7 +1774,15 @@ fn render_spectator_frame_html(snapshot: &Snapshot, width: u16, height: u16) -> 
 
 async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
     let player_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4();
+    let user_id = user.id;
     let rewards = user.rewards.clone();
+    if let Err(err) = close_open_player_sessions_for_user(&state.db, user_id).await {
+        error!("failed to close replaced player sessions: {err}");
+    }
+    if let Err(err) = start_player_session(&state.db, session_id, user_id, state.boot_id).await {
+        error!("failed to record player session start: {err}");
+    }
     if let Some(save) = state.game.add_player(player_id.clone(), user).await {
         if let Err(err) = persist_economy(&state.db, save).await {
             error!("failed to persist replaced player economy on reconnect: {err}");
@@ -1792,14 +1801,25 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
         if let Some(save) = state.game.remove_player(&player_id).await {
             let _ = persist_economy(&state.db, save).await;
         }
+        if let Err(err) = end_player_session(&state.db, session_id, "welcome_failed").await {
+            error!("failed to record player session end: {err}");
+        }
         return;
     }
 
+    let mut last_session_seen_write = Instant::now();
+    let mut end_reason = "disconnect";
     loop {
         tokio::select! {
             message = receiver.next() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
+                        touch_player_session_throttled(
+                            &state.db,
+                            session_id,
+                            &mut last_session_seen_write,
+                        )
+                        .await;
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::Input {
                                 up,
@@ -1875,7 +1895,14 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
                     }
                     Some(Ok(Message::Ping(bytes))) => {
                         state.game.touch_player(&player_id).await;
+                        touch_player_session_throttled(
+                            &state.db,
+                            session_id,
+                            &mut last_session_seen_write,
+                        )
+                        .await;
                         if sender.send(Message::Pong(bytes)).await.is_err() {
+                            end_reason = "send_failed";
                             break;
                         }
                     }
@@ -1883,15 +1910,18 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
                     Some(Ok(_)) => {}
                     Some(Err(err)) => {
                         error!("websocket error: {err}");
+                        end_reason = "websocket_error";
                         break;
                     }
                 }
             }
             snapshot = snapshots.recv() => {
                 let Ok(snapshot) = snapshot else {
+                    end_reason = "snapshot_channel_closed";
                     break;
                 };
                 if send_json(&mut sender, &ServerMessage::Snapshot(snapshot)).await.is_err() {
+                    end_reason = "send_failed";
                     break;
                 }
             }
@@ -1901,6 +1931,7 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
                     .is_player_stale(&player_id, Duration::from_secs(20))
                     .await
                 {
+                    end_reason = "stale";
                     break;
                 }
             }
@@ -1911,6 +1942,9 @@ async fn handle_ws(socket: WebSocket, state: AppState, user: GameUser) {
         if let Err(err) = persist_economy(&state.db, save).await {
             error!("failed to persist player economy on disconnect: {err}");
         }
+    }
+    if let Err(err) = end_player_session(&state.db, session_id, end_reason).await {
+        error!("failed to record player session end: {err}");
     }
 }
 
@@ -1983,6 +2017,98 @@ async fn persist_economy(db: &PgPool, save: EconomySave) -> anyhow::Result<()> {
             .collect::<Vec<_>>(),
     ))
     .bind(pixel_inventory_json(save.owned_pixels))
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn close_stale_player_sessions_on_boot(db: &PgPool, boot_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE player_sessions
+        SET ended_at = COALESCE(ended_at, last_seen_at),
+            end_reason = COALESCE(end_reason, 'server_restarted')
+        WHERE ended_at IS NULL AND boot_id <> $1
+        "#,
+    )
+    .bind(boot_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn close_open_player_sessions_for_user(db: &PgPool, user_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE player_sessions
+        SET ended_at = now(),
+            last_seen_at = now(),
+            end_reason = COALESCE(end_reason, 'replaced')
+        WHERE user_id = $1 AND ended_at IS NULL
+        "#,
+    )
+    .bind(user_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn start_player_session(
+    db: &PgPool,
+    session_id: Uuid,
+    user_id: Uuid,
+    boot_id: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO player_sessions (id, user_id, boot_id)
+        VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(boot_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn touch_player_session_throttled(db: &PgPool, session_id: Uuid, last_write: &mut Instant) {
+    if last_write.elapsed() < Duration::from_secs(15) {
+        return;
+    }
+    *last_write = Instant::now();
+    if let Err(err) = touch_player_session(db, session_id).await {
+        error!("failed to record player session activity: {err}");
+    }
+}
+
+async fn touch_player_session(db: &PgPool, session_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE player_sessions
+        SET last_seen_at = now()
+        WHERE id = $1 AND ended_at IS NULL
+        "#,
+    )
+    .bind(session_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn end_player_session(db: &PgPool, session_id: Uuid, reason: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE player_sessions
+        SET ended_at = COALESCE(ended_at, now()),
+            last_seen_at = now(),
+            end_reason = COALESCE(end_reason, $2)
+        WHERE id = $1
+        "#,
+    )
+    .bind(session_id)
+    .bind(reason)
     .execute(db)
     .await?;
     Ok(())
