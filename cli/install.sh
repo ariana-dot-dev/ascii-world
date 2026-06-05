@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="${GAME_CLI_REPO:-ariana-dot-dev/ascii-world}"
 INSTALL_DIR="${GAME_INSTALL_DIR:-}"
+DOWNLOAD_BASE="${GAME_DOWNLOAD_BASE:-https://world.ascii.dev/download}"
 
 case "$(uname -s)" in
   Linux) OS="linux" ;;
@@ -17,7 +17,7 @@ case "$(uname -m)" in
 esac
 
 ASSET="world-${OS}-${ARCH}"
-URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+URL="${DOWNLOAD_BASE}/${ASSET}"
 
 if [ -z "$INSTALL_DIR" ]; then
   if [ -w /usr/local/bin ]; then

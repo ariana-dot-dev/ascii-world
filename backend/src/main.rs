@@ -3,7 +3,7 @@ use std::{
     env,
     f64::consts::{FRAC_PI_2, PI, TAU},
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -513,6 +513,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/privacy", get(privacy_page))
         .route("/install.sh", get(install_sh))
         .route("/install.ps1", get(install_ps1))
+        .route("/download/{asset}", get(download_cli_asset))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -3047,8 +3048,8 @@ async fn install_sh() -> Response {
     let script = r#"#!/usr/bin/env sh
 set -eu
 
-REPO="${GAME_CLI_REPO:-ariana-dot-dev/ascii-world}"
 INSTALL_DIR="${GAME_INSTALL_DIR:-}"
+DOWNLOAD_BASE="${GAME_DOWNLOAD_BASE:-https://world.ascii.dev/download}"
 
 case "$(uname -s)" in
   Linux) OS="linux" ;;
@@ -3063,7 +3064,7 @@ case "$(uname -m)" in
 esac
 
 ASSET="world-${OS}-${ARCH}"
-URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+URL="${DOWNLOAD_BASE}/${ASSET}"
 
 if [ -z "$INSTALL_DIR" ]; then
   if [ -w /usr/local/bin ]; then
@@ -3093,10 +3094,10 @@ echo "Run: world"
 async fn install_ps1() -> Response {
     let script = r#"$ErrorActionPreference = "Stop"
 
-$repo = if ($env:GAME_CLI_REPO) { $env:GAME_CLI_REPO } else { "ariana-dot-dev/ascii-world" }
 $installDir = if ($env:GAME_INSTALL_DIR) { $env:GAME_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps" }
+$downloadBase = if ($env:GAME_DOWNLOAD_BASE) { $env:GAME_DOWNLOAD_BASE } else { "https://world.ascii.dev/download" }
 $asset = "world-windows-x64.exe"
-$url = "https://github.com/$repo/releases/latest/download/$asset"
+$url = "$downloadBase/$asset"
 $target = Join-Path $installDir "world.exe"
 $tmp = New-TemporaryFile
 
@@ -3108,6 +3109,35 @@ Write-Host "Installed world to $target"
 Write-Host "Run: world"
 "#;
     ([("content-type", "text/plain; charset=utf-8")], script).into_response()
+}
+
+async fn download_cli_asset(AxumPath(asset): AxumPath<String>) -> Response {
+    const ALLOWED_ASSETS: &[&str] = &[
+        "world-linux-x64",
+        "world-linux-arm64",
+        "world-darwin-x64",
+        "world-darwin-arm64",
+        "world-windows-x64.exe",
+    ];
+
+    if !ALLOWED_ASSETS.contains(&asset.as_str()) {
+        return (StatusCode::NOT_FOUND, "asset not found").into_response();
+    }
+
+    let asset_dir = env::var("GAME_CLI_ASSET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/opt/ascii-game/releases/latest"));
+    let path = asset_dir.join(&asset);
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return (StatusCode::NOT_FOUND, "asset not found").into_response();
+    };
+
+    let content_type = if asset.ends_with(".exe") {
+        "application/vnd.microsoft.portable-executable"
+    } else {
+        "application/octet-stream"
+    };
+    ([("content-type", content_type)], bytes).into_response()
 }
 
 struct AppError(anyhow::Error);

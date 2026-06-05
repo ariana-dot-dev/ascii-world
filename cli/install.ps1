@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = if ($env:GAME_CLI_REPO) { $env:GAME_CLI_REPO } else { "ariana-dot-dev/ascii-world" }
 $InstallDir = if ($env:GAME_INSTALL_DIR) { $env:GAME_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps" }
+$DownloadBase = if ($env:GAME_DOWNLOAD_BASE) { $env:GAME_DOWNLOAD_BASE } else { "https://world.ascii.dev/download" }
 
 if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne "X64") {
   Write-Error "Unsupported architecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
@@ -9,7 +9,7 @@ if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne "X64
 }
 
 $Asset = "world-windows-x64.exe"
-$Url = "https://github.com/$Repo/releases/latest/download/$Asset"
+$Url = "$DownloadBase/$Asset"
 $Target = Join-Path $InstallDir "world.exe"
 $Tmp = New-TemporaryFile
 

@@ -740,9 +740,7 @@ async fn poll_x_login(backend_url: &str, poll_token: &str) -> anyhow::Result<Log
 
 fn load_dotenv() {
     dotenvy::dotenv().ok();
-    if env::var("GAME_BACKEND_URL").is_err() {
-        dotenvy::from_path("cli/.env").ok();
-    }
+    dotenvy::from_path_override("cli/.env").ok();
     if env::var("GAME_BACKEND_URL").is_err() {
         dotenvy::from_path(".env.production").ok();
     }
@@ -826,17 +824,12 @@ fn runtime_environment() -> String {
 }
 
 async fn try_self_update() {
-    let Some(repo) = option_env!("GAME_CLI_REPO") else {
-        return;
-    };
-    if repo.trim().is_empty() || repo == "REPLACE_WITH_GITHUB_REPO" {
-        return;
-    }
-
     let Some(asset) = current_asset_name() else {
         return;
     };
-    let url = format!("https://github.com/{repo}/releases/latest/download/{asset}");
+    let update_base =
+        option_env!("GAME_DOWNLOAD_BASE_URL").unwrap_or("https://world.ascii.dev/download");
+    let url = format!("{}/{asset}", update_base.trim_end_matches('/'));
     let Ok(response) = reqwest::get(url).await else {
         return;
     };
