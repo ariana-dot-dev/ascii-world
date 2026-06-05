@@ -512,6 +512,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/x/callback", get(auth_x_callback))
         .route("/terms", get(terms_page))
         .route("/privacy", get(privacy_page))
+        .route("/robots.txt", get(robots_txt))
+        .route("/sitemap.xml", get(sitemap_xml))
+        .route("/og.png", get(og_png))
+        .route("/assets/og.png", get(og_png))
         .route("/install.sh", get(install_sh))
         .route("/install.ps1", get(install_ps1))
         .route("/download/{asset}", get(download_cli_asset))
@@ -1019,7 +1023,45 @@ async fn landing_page() -> Response {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Ascii World is an idle multiplayer terminal game for vibe coders. Join from your terminal, earn tokens, collect lobsters, and leave pixels on a shared ASCII planet.">
+<meta name="robots" content="index,follow">
+<meta name="theme-color" content="#1e1e1e">
+<link rel="canonical" href="https://world.ascii.dev/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Ascii World">
+<meta property="og:title" content="Ascii World">
+<meta property="og:description" content="The idle multiplayer terminal game for vibe coders.">
+<meta property="og:url" content="https://world.ascii.dev/">
+<meta property="og:image" content="https://world.ascii.dev/og.png">
+<meta property="og:image:secure_url" content="https://world.ascii.dev/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Ascii World terminal game preview with an ASCII Earth.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@asciidotdev">
+<meta name="twitter:title" content="Ascii World">
+<meta name="twitter:description" content="The idle multiplayer terminal game for vibe coders.">
+<meta name="twitter:image" content="https://world.ascii.dev/og.png">
+<meta name="twitter:image:alt" content="Ascii World terminal game preview with an ASCII Earth.">
 <title>Ascii World</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Ascii World",
+  "applicationCategory": "GameApplication",
+  "operatingSystem": "Linux, macOS, Windows",
+  "url": "https://world.ascii.dev/",
+  "image": "https://world.ascii.dev/og.png",
+  "description": "Ascii World is an idle multiplayer terminal game for vibe coders.",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
 <style>
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
@@ -1633,6 +1675,50 @@ async fn privacy_page() -> Response {
         "Privacy Policy: Ascii World uses X login to identify your player name. Local token usage is tracked locally by the CLI for gameplay and is not uploaded.",
         StatusCode::OK,
     )
+}
+
+async fn robots_txt() -> Response {
+    const ROBOTS: &str = "User-agent: *\nAllow: /\nSitemap: https://world.ascii.dev/sitemap.xml\n";
+    ([("content-type", "text/plain; charset=utf-8")], ROBOTS).into_response()
+}
+
+async fn sitemap_xml() -> Response {
+    const SITEMAP: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://world.ascii.dev/</loc>
+    <changefreq>daily</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://world.ascii.dev/terms</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.3</priority>
+  </url>
+  <url>
+    <loc>https://world.ascii.dev/privacy</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.3</priority>
+  </url>
+</urlset>
+"#;
+    (
+        [("content-type", "application/xml; charset=utf-8")],
+        SITEMAP,
+    )
+        .into_response()
+}
+
+async fn og_png() -> Response {
+    const OG_PNG: &[u8] = include_bytes!("../../assets/og.png");
+    (
+        [
+            ("content-type", "image/png"),
+            ("cache-control", "public, max-age=86400"),
+        ],
+        OG_PNG,
+    )
+        .into_response()
 }
 
 fn html(body: &str, status: StatusCode) -> Response {
