@@ -3,6 +3,7 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    process::{self, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc as std_mpsc, Arc, Mutex,
@@ -924,16 +925,59 @@ async fn try_self_update() {
     let Ok(current_exe) = env::current_exe() else {
         return;
     };
+    if fs::read(&current_exe)
+        .map(|current| current == bytes.as_ref())
+        .unwrap_or(false)
+    {
+        return;
+    }
     let temp = current_exe.with_extension("new");
     if fs::write(&temp, bytes).is_err() {
         return;
     }
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
+        if spawn_windows_self_update(&current_exe, &temp) {
+            process::exit(0);
+        }
+        return;
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(unix)]
+        {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(0o755));
+        }
+        let _ = fs::rename(temp, current_exe);
     }
-    let _ = fs::rename(temp, current_exe);
+}
+
+#[cfg(windows)]
+fn spawn_windows_self_update(current_exe: &Path, temp: &Path) -> bool {
+    fn ps_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "''"))
+    }
+
+    let script = format!(
+        "$pidToWait = {}; \
+         Wait-Process -Id $pidToWait -ErrorAction SilentlyContinue; \
+         Start-Sleep -Milliseconds 200; \
+         Move-Item -Force -LiteralPath {} -Destination {}; \
+         Start-Process -FilePath {}",
+        process::id(),
+        ps_quote(temp),
+        ps_quote(current_exe),
+        ps_quote(current_exe),
+    );
+
+    Command::new("powershell.exe")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
 }
 
 fn current_asset_name() -> Option<&'static str> {
