@@ -2972,7 +2972,7 @@ fn resolve_punch(world: &mut GameWorld, attacker_id: &str, now: Instant) {
     let target_id = world
         .players
         .iter()
-        .filter(|(id, player)| id.as_str() != attacker_id && player.combat_mode)
+        .filter(|(id, player)| id.as_str() != attacker_id && (player.combat_mode || player.fake))
         .filter(|(_, player)| {
             player
                 .invulnerable_until
@@ -3046,20 +3046,7 @@ fn tick_world(world: &mut GameWorld, dt: f64) -> Vec<EconomySave> {
     let mut saves = Vec::new();
     let economy_now = Instant::now();
     for player in world.players.values_mut().filter(|player| !player.fake) {
-        if player
-            .punching_until
-            .map(|until| until <= economy_now)
-            .unwrap_or(false)
-        {
-            player.punching_until = None;
-        }
-        if player
-            .invulnerable_until
-            .map(|until| until <= economy_now)
-            .unwrap_or(false)
-        {
-            player.invulnerable_until = None;
-        }
+        clear_combat_timers(player, economy_now);
         accrue_lobsters(player, economy_now);
         tick_jump(player, dt);
         let screen_up = screen_up_for_player(player);
@@ -3102,34 +3089,77 @@ fn tick_world(world: &mut GameWorld, dt: f64) -> Vec<EconomySave> {
             } else {
                 1.0
             };
-            let angular_distance = ANGULAR_SPEED_RADIANS_PER_SECOND * dt * movement_multiplier;
-            let rotation_axis = player.position.cross(direction).normalize();
-            let previous_position = player.position;
-            player.position = player
-                .position
-                .rotate_around(rotation_axis, angular_distance)
-                .normalize();
-            let transported_up = player
-                .basis_up
-                .rotate_around(rotation_axis, angular_distance)
-                .normalize();
-            player.basis_up = transported_up
-                .add(player.position.scale(-transported_up.dot(player.position)))
-                .normalize();
-            let screen_right = screen_right_for_player(player);
-            update_facing_from_movement(player, previous_position, player.position, screen_right);
-            player.walking_phase = player.walking_phase.wrapping_add(1);
+            move_player_along_tangent(player, direction, dt, movement_multiplier);
         }
     }
 
     let mut rng = rand::rng();
     for player in world.players.values_mut().filter(|player| player.fake) {
-        tick_npc_jump(player, dt, &mut rng);
+        clear_combat_timers(player, economy_now);
         tick_jump(player, dt);
+        let airborne = player.jump_height > JUMP_GROUND_EPSILON || player.jump_velocity > 0.0;
+        if airborne {
+            if let Some(momentum) = player.jump_momentum {
+                let direction = momentum
+                    .add(player.position.scale(-momentum.dot(player.position)))
+                    .normalize();
+                if direction.length() > 1e-6 {
+                    let movement_multiplier = player.jump_momentum_multiplier;
+                    move_player_along_tangent(player, direction, dt, movement_multiplier);
+                }
+            }
+            continue;
+        }
+        tick_npc_jump(player, dt, &mut rng);
+        if player.jump_height > JUMP_GROUND_EPSILON || player.jump_velocity > 0.0 {
+            continue;
+        }
         tick_npc(player, dt, &mut rng);
     }
     tick_pickups(world, economy_now, &mut rng, &mut saves);
     saves
+}
+
+fn clear_combat_timers(player: &mut Player, now: Instant) {
+    if player
+        .punching_until
+        .map(|until| until <= now)
+        .unwrap_or(false)
+    {
+        player.punching_until = None;
+    }
+    if player
+        .invulnerable_until
+        .map(|until| until <= now)
+        .unwrap_or(false)
+    {
+        player.invulnerable_until = None;
+    }
+}
+
+fn move_player_along_tangent(
+    player: &mut Player,
+    direction: Vec3,
+    dt: f64,
+    movement_multiplier: f64,
+) {
+    let angular_distance = ANGULAR_SPEED_RADIANS_PER_SECOND * dt * movement_multiplier;
+    let rotation_axis = player.position.cross(direction).normalize();
+    let previous_position = player.position;
+    player.position = player
+        .position
+        .rotate_around(rotation_axis, angular_distance)
+        .normalize();
+    let transported_up = player
+        .basis_up
+        .rotate_around(rotation_axis, angular_distance)
+        .normalize();
+    player.basis_up = transported_up
+        .add(player.position.scale(-transported_up.dot(player.position)))
+        .normalize();
+    let screen_right = screen_right_for_player(player);
+    update_facing_from_movement(player, previous_position, player.position, screen_right);
+    player.walking_phase = player.walking_phase.wrapping_add(1);
 }
 
 fn tick_pickups(
@@ -3963,6 +3993,81 @@ mod tests {
             world.players.get("target").unwrap().invulnerable_until,
             first_invulnerable_until
         );
+    }
+
+    #[test]
+    fn combat_punch_knocks_back_nearby_npc_without_npc_combat_mode() {
+        let now = Instant::now();
+        let attacker_position = Vec3::new(1.0, 0.0, 0.0);
+        let target_position = attacker_position
+            .rotate_around(Vec3::Z, PUNCH_REACH_RADIANS * 0.5)
+            .normalize();
+        let mut attacker = test_player("attacker", attacker_position);
+        attacker.combat_mode = true;
+        attacker.facing = 1;
+        attacker.basis_up = Vec3::Z;
+        let mut npc = test_player("npc", target_position);
+        npc.fake = true;
+        npc.combat_mode = false;
+        let mut world = GameWorld {
+            players: HashMap::from([("attacker".to_string(), attacker), ("npc".to_string(), npc)]),
+            placed_pixels: HashMap::new(),
+            pickups: HashMap::new(),
+            pickup_rewards: Vec::new(),
+            next_pickup_id: 0,
+            last_pickup_spawn: now,
+            next_npc_id: 0,
+            last_tick: now,
+        };
+
+        resolve_punch(&mut world, "attacker", now);
+
+        let npc = world.players.get("npc").unwrap();
+        assert_eq!(npc.jump_velocity, JUMP_IMPULSE_CELLS_PER_SECOND);
+        assert!(npc.jump_momentum.is_some());
+        assert!(npc.invulnerable_until.unwrap() > now);
+    }
+
+    #[test]
+    fn punched_npc_moves_by_knockback_before_resuming_scripted_path() {
+        let now = Instant::now();
+        let start = Vec3::new(1.0, 0.0, 0.0);
+        let scripted_target = Vec3::new(0.0, 1.0, 0.0);
+        let mut npc = test_player("npc", start);
+        npc.fake = true;
+        npc.jump_height = JUMP_GROUND_EPSILON;
+        npc.jump_velocity = JUMP_IMPULSE_CELLS_PER_SECOND;
+        npc.jump_momentum = Some(Vec3::new(0.0, 1.0, 0.0));
+        npc.last_jump_momentum = npc.jump_momentum;
+        npc.jump_momentum_multiplier = THIRD_MOMENTUM_JUMP_MULTIPLIER;
+        npc.npc_movement = Some(NpcMovement::Moving {
+            start,
+            target: scripted_target,
+            lateral: Vec3::Z,
+            path_length: start.angle_to(scripted_target),
+            distance: 0.0,
+        });
+        let mut world = GameWorld {
+            players: HashMap::from([("npc".to_string(), npc)]),
+            placed_pixels: HashMap::new(),
+            pickups: HashMap::new(),
+            pickup_rewards: Vec::new(),
+            next_pickup_id: 0,
+            last_pickup_spawn: now,
+            next_npc_id: 0,
+            last_tick: now,
+        };
+
+        tick_world(&mut world, 1.0 / 60.0);
+
+        let npc = world.players.get("npc").unwrap();
+        assert!(npc.position.angle_to(start) > 0.0);
+        assert!(matches!(
+            npc.npc_movement,
+            Some(NpcMovement::Moving { distance, .. }) if distance == 0.0
+        ));
+        assert!((npc.position.length() - 1.0).abs() < 1e-9);
+        assert!(npc.position.dot(npc.basis_up).abs() < 1e-9);
     }
 
     #[test]

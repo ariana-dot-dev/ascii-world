@@ -2182,11 +2182,11 @@ fn render_app_frame(
 }
 
 fn draw_header_promo(frame: &mut FrameBuffer) {
-    if frame.height < 2 {
+    if frame.height < 3 {
         return;
     }
     let promo_x = frame.width as i32 - display_width(HEADER_PROMO) as i32 - 1;
-    frame.text(promo_x.max(0), 1, HEADER_PROMO, HUD);
+    frame.text(promo_x.max(0), 2, HEADER_PROMO, HUD);
 }
 
 fn render_panel(frame: &mut FrameBuffer, rect: Rect, panel: &UiPanel) {

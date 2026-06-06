@@ -11,6 +11,7 @@ mod land_mask;
 pub const PIXEL_COLOR_COUNT: usize = 5;
 const JUMP_GROUND_EPSILON: f64 = 0.02;
 const HEADER_CONTROLS: &str = "arrows move, space jumps, M market, esc exits";
+const HEADER_COMBAT: &str = "C toggles combat mode, Q punches";
 const HEADER_PROMO: &str = "post a screenshot on X and tag @asciidotdev to get 20k free \u{1f99e}";
 const FOOTER_TEXT: &str =
     "Made and hosted by agents on https://box.ascii.dev, the cheapest and most powerful AI sandboxes";
@@ -435,12 +436,13 @@ pub fn render_game_frame(
 
     if options.show_header {
         frame.text(0, 0, HEADER_CONTROLS, HUD);
+        frame.text(0, 1, HEADER_COMBAT, HUD);
         if let Some(economy) = economy_header(state, width as usize) {
             let economy_x = width as i32 - display_width(&economy) as i32 - 1;
             frame.text(economy_x.max(0), 0, &economy, HUD);
         }
         let promo_x = width as i32 - display_width(HEADER_PROMO) as i32 - 1;
-        frame.text(promo_x.max(0), 1, HEADER_PROMO, HUD);
+        frame.text(promo_x.max(0), 2, HEADER_PROMO, HUD);
     }
     if options.show_pixel_inventory {
         draw_pixel_inventory(&mut frame, selected_pixel_color, pixel_inventory);
@@ -615,9 +617,9 @@ fn draw_lobster_leaderboard(frame: &mut FrameBuffer, leaderboard: &[LeaderboardE
     }
     let panel_width = lobster_leaderboard_width(frame.width);
     let x = frame.width as i32 - panel_width as i32 - 1;
-    let mut line_y = 4;
+    let mut line_y = 5;
     let max_y = frame.height as i32 - 2;
-    draw_clipped_text(frame, x, 3, "\u{1f99e} leaders", panel_width, ACCENT_2);
+    draw_clipped_text(frame, x, 4, "\u{1f99e} leaders", panel_width, ACCENT_2);
     for (index, player) in leaders.into_iter().enumerate() {
         if line_y > max_y {
             break;
