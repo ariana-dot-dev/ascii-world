@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     f64::consts::{FRAC_PI_2, PI, TAU},
     net::SocketAddr,
@@ -171,6 +171,7 @@ struct EconomySave {
     total_tokens: u64,
     all_time_tokens: u64,
     lobster_micros: u64,
+    lobster_delta_micros: Option<i64>,
     equipped_head: String,
     owned_heads: Vec<String>,
     owned_pixels: [u64; PIXEL_COLOR_COUNT],
@@ -2101,7 +2102,10 @@ async fn persist_economy(db: &PgPool, save: EconomySave) -> anyhow::Result<()> {
         UPDATE game_users
         SET total_tokens = GREATEST(total_tokens, $2),
             all_time_tokens = GREATEST(all_time_tokens, $3),
-            lobster_micros = $4,
+            lobster_micros = CASE
+                WHEN $8::BIGINT IS NULL THEN GREATEST(lobster_micros, $4)
+                ELSE GREATEST(0, lobster_micros + $8::BIGINT)
+            END,
             last_lobster_at = now(),
             equipped_head = $5,
             owned_heads = $6,
@@ -2122,6 +2126,7 @@ async fn persist_economy(db: &PgPool, save: EconomySave) -> anyhow::Result<()> {
             .collect::<Vec<_>>(),
     ))
     .bind(pixel_inventory_json(save.owned_pixels))
+    .bind(save.lobster_delta_micros)
     .execute(db)
     .await?;
     Ok(())
@@ -2282,6 +2287,7 @@ impl Game {
                 total_tokens: player.total_tokens,
                 all_time_tokens: player.all_time_tokens,
                 lobster_micros: player.lobster_micros,
+                lobster_delta_micros: None,
                 equipped_head: player.equipped_head.clone(),
                 owned_heads: player.owned_heads.clone(),
                 owned_pixels: player.owned_pixels,
@@ -2384,6 +2390,7 @@ impl Game {
                 total_tokens: player.total_tokens,
                 all_time_tokens: player.all_time_tokens,
                 lobster_micros: player.lobster_micros,
+                lobster_delta_micros: None,
                 equipped_head: player.equipped_head,
                 owned_heads: player.owned_heads,
                 owned_pixels: player.owned_pixels,
@@ -2435,6 +2442,34 @@ impl Game {
         resolve_punch(&mut world, id, Instant::now());
     }
 
+    async fn active_user_ids(&self) -> Vec<Uuid> {
+        let world = self.world.lock().await;
+        world
+            .players
+            .values()
+            .filter_map(|player| player.user_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    async fn apply_lobster_balance_refresh(&self, balances: HashMap<Uuid, u64>) {
+        let mut world = self.world.lock().await;
+        let now = Instant::now();
+        for player in world.players.values_mut().filter(|player| !player.fake) {
+            let Some(user_id) = player.user_id else {
+                continue;
+            };
+            let Some(&db_lobster_micros) = balances.get(&user_id) else {
+                continue;
+            };
+            if db_lobster_micros > player.lobster_micros {
+                player.lobster_micros = db_lobster_micros;
+                player.last_economy_at = now;
+            }
+        }
+    }
+
     async fn set_token_totals(
         &self,
         id: &str,
@@ -2452,6 +2487,7 @@ impl Game {
             total_tokens: player.total_tokens,
             all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
+            lobster_delta_micros: None,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
             owned_pixels: player.owned_pixels,
@@ -2467,6 +2503,7 @@ impl Game {
         let player = world.players.get_mut(id)?;
         player.last_seen = Instant::now();
         accrue_lobsters(player, Instant::now());
+        let mut lobster_delta_micros = None;
         if player.owned_heads.iter().any(|owned| owned == item_id) {
             player.equipped_head = item.id;
         } else {
@@ -2475,6 +2512,7 @@ impl Game {
                 return None;
             }
             player.lobster_micros = player.lobster_micros.saturating_sub(price_micros);
+            lobster_delta_micros = Some(-(price_micros as i64));
             player.owned_heads.push(item.id.clone());
             player.equipped_head = item.id;
         }
@@ -2483,6 +2521,7 @@ impl Game {
             total_tokens: player.total_tokens,
             all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
+            lobster_delta_micros,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
             owned_pixels: player.owned_pixels,
@@ -2506,6 +2545,7 @@ impl Game {
             total_tokens: player.total_tokens,
             all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
+            lobster_delta_micros: None,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
             owned_pixels: player.owned_pixels,
@@ -2531,6 +2571,7 @@ impl Game {
             total_tokens: player.total_tokens,
             all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
+            lobster_delta_micros: Some(-(price_micros as i64)),
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
             owned_pixels: player.owned_pixels,
@@ -2554,6 +2595,7 @@ impl Game {
             total_tokens: player.total_tokens,
             all_time_tokens: player.all_time_tokens,
             lobster_micros: player.lobster_micros,
+            lobster_delta_micros: None,
             equipped_head: player.equipped_head.clone(),
             owned_heads: player.owned_heads.clone(),
             owned_pixels: player.owned_pixels,
@@ -2580,6 +2622,13 @@ async fn run_game_loop(game: GameHandle, db: PgPool) {
             match fetch_lobster_leaderboard(&db).await {
                 Ok(next_leaderboard) => leaderboard = next_leaderboard,
                 Err(err) => error!("failed to refresh lobster leaderboard: {err}"),
+            }
+            let active_user_ids = game.active_user_ids().await;
+            if !active_user_ids.is_empty() {
+                match fetch_lobster_balances(&db, &active_user_ids).await {
+                    Ok(balances) => game.apply_lobster_balance_refresh(balances).await,
+                    Err(err) => error!("failed to refresh active lobster balances: {err}"),
+                }
             }
             next_leaderboard_refresh = now + Duration::from_secs(5);
         }
@@ -2627,6 +2676,27 @@ async fn fetch_lobster_leaderboard(db: &PgPool) -> anyhow::Result<Vec<Leaderboar
             }
         })
         .filter(|entry| !entry.username.is_empty())
+        .collect())
+}
+
+async fn fetch_lobster_balances(
+    db: &PgPool,
+    user_ids: &[Uuid],
+) -> anyhow::Result<HashMap<Uuid, u64>> {
+    let rows = sqlx::query_as::<_, (Uuid, i64)>(
+        r#"
+        SELECT id, lobster_micros
+        FROM game_users
+        WHERE id = ANY($1)
+        "#,
+    )
+    .bind(user_ids)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, lobster_micros)| (id, lobster_micros.max(0) as u64))
         .collect())
 }
 
@@ -3130,6 +3200,7 @@ fn economy_save(player: &Player) -> Option<EconomySave> {
         total_tokens: player.total_tokens,
         all_time_tokens: player.all_time_tokens,
         lobster_micros: player.lobster_micros,
+        lobster_delta_micros: None,
         equipped_head: player.equipped_head.clone(),
         owned_heads: player.owned_heads.clone(),
         owned_pixels: player.owned_pixels,
