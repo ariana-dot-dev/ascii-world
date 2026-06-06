@@ -16,10 +16,12 @@ set -euo pipefail
 # - Use explicit BIGINT arithmetic. `20000 * 1000000` overflows as a default SQL
 #   integer expression before being assigned to the BIGINT column.
 # - The backend keeps active players in memory and persists economy later. If a
-#   user is online while this runs, a later in-memory save may overwrite the DB
-#   gift. The script warns when a recent live session is visible; for heavy
-#   campaign use, the better long-term fix is an admin API or ledger table that
-#   the game loop applies in memory.
+#   user is online while this runs, a later in-memory save can overwrite the DB
+#   gift. The script refuses active/recent players by default. Use
+#   GIFT_FORCE_ACTIVE=1 only if you have intentionally stopped/restarted the
+#   backend or otherwise know the in-memory player state cannot overwrite it.
+#   For heavy campaign use, the better long-term fix is an admin API or ledger
+#   table that the game loop applies in memory.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ -n "${BOX_BIN:-}" ]; then
@@ -38,6 +40,7 @@ DB_CONTAINER="${DB_CONTAINER:-game-postgres}"
 DB_NAME="${DB_NAME:-postgres}"
 DB_USER="${DB_USER:-postgres}"
 LOBSTER_MICROS="${LOBSTER_MICROS:-1000000}"
+GIFT_FORCE_ACTIVE="${GIFT_FORCE_ACTIVE:-0}"
 
 usage() {
   cat >&2 <<EOF
@@ -146,16 +149,36 @@ JOIN gift_target USING (id);
 SELECT
   'recent_session' AS phase,
   game_users.x_username,
-  player_sessions.player_id,
-  player_sessions.connected_at,
-  player_sessions.disconnected_at
+  player_sessions.id AS session_id,
+  player_sessions.started_at,
+  player_sessions.last_seen_at,
+  player_sessions.ended_at,
+  player_sessions.end_reason
 FROM player_sessions
 JOIN game_users ON game_users.id = player_sessions.user_id
 JOIN gift_target ON gift_target.id = game_users.id
-WHERE player_sessions.disconnected_at IS NULL
-   OR player_sessions.connected_at > now() - interval '10 minutes'
-ORDER BY player_sessions.connected_at DESC
+WHERE player_sessions.ended_at IS NULL
+   OR player_sessions.last_seen_at > now() - interval '10 minutes'
+   OR player_sessions.ended_at > now() - interval '10 minutes'
+ORDER BY player_sessions.started_at DESC
 LIMIT 5;
+
+DO \$\$
+DECLARE
+  recent_count integer;
+BEGIN
+  SELECT count(*) INTO recent_count
+  FROM player_sessions
+  JOIN gift_target ON gift_target.id = player_sessions.user_id
+  WHERE player_sessions.ended_at IS NULL
+     OR player_sessions.last_seen_at > now() - interval '10 minutes'
+     OR player_sessions.ended_at > now() - interval '10 minutes';
+
+  IF recent_count > 0 AND ${GIFT_FORCE_ACTIVE}::integer <> 1 THEN
+    RAISE EXCEPTION 'player has active/recent session; gift could be overwritten by in-memory backend state. Retry later or set GIFT_FORCE_ACTIVE=1';
+  END IF;
+END
+\$\$;
 
 UPDATE game_users
 SET lobster_micros = lobster_micros + (${AMOUNT}::bigint * ${LOBSTER_MICROS}::bigint),
