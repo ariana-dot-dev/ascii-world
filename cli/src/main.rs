@@ -83,15 +83,59 @@ async fn main() -> anyhow::Result<()> {
     let mut state = load_state(&state_path)?;
     let detected_ai_tools = ai_usage::detect_supported_tools();
 
-    if state.ai_usage_consent && state.ai_usage_baseline.is_none() {
-        state.ai_usage_baseline = Some(ai_usage::scan_enabled(
-            &detected_ai_tools,
-            &state.enabled_ai_tools,
-        ));
-        save_state(&state_path, &state)?;
+    if state.ai_usage_consent {
+        let mut state_changed = false;
+        if state.ai_usage_baseline.is_none() {
+            state.ai_usage_baseline = Some(ai_usage::scan_enabled(
+                &detected_ai_tools,
+                &state.enabled_ai_tools,
+            ));
+            state_changed = true;
+        }
+        if enable_new_detected_ai_tools(&mut state, &detected_ai_tools) {
+            state_changed = true;
+        }
+        if state_changed {
+            save_state(&state_path, &state)?;
+        }
     }
 
     run_client(backend_url, state_path, state, detected_ai_tools).await
+}
+
+fn enable_new_detected_ai_tools(
+    state: &mut PersistedState,
+    detected: &[ai_usage::DetectedTool],
+) -> bool {
+    if !state.ai_usage_consent {
+        return false;
+    }
+
+    let mut enabled = state
+        .enabled_ai_tools
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut newly_enabled = Vec::new();
+    for tool in detected {
+        if enabled.insert(tool.id.to_string()) {
+            let id = tool.id.to_string();
+            state.enabled_ai_tools.push(id.clone());
+            newly_enabled.push(id);
+        }
+    }
+
+    if newly_enabled.is_empty() {
+        return false;
+    }
+
+    let new_tool_baseline = ai_usage::scan_enabled(detected, &newly_enabled);
+    if let Some(baseline) = &mut state.ai_usage_baseline {
+        baseline.add_snapshot(&new_tool_baseline);
+    } else {
+        state.ai_usage_baseline = Some(new_tool_baseline);
+    }
+    true
 }
 
 enum ClientPhase {
@@ -2738,6 +2782,23 @@ mod ai_usage {
             }
         }
 
+        pub fn add_snapshot(&mut self, extra: &UsageSnapshot) {
+            self.input_tokens = self.input_tokens.saturating_add(extra.input_tokens);
+            self.output_tokens = self.output_tokens.saturating_add(extra.output_tokens);
+            self.cached_tokens = self.cached_tokens.saturating_add(extra.cached_tokens);
+            self.reasoning_tokens = self.reasoning_tokens.saturating_add(extra.reasoning_tokens);
+            for (id, usage) in &extra.tools {
+                let entry = self.tools.entry(id.clone()).or_default();
+                entry.input_tokens = entry.input_tokens.saturating_add(usage.input_tokens);
+                entry.output_tokens = entry.output_tokens.saturating_add(usage.output_tokens);
+                entry.cached_tokens = entry.cached_tokens.saturating_add(usage.cached_tokens);
+                entry.reasoning_tokens = entry
+                    .reasoning_tokens
+                    .saturating_add(usage.reasoning_tokens);
+                entry.sources = usage.sources;
+            }
+        }
+
         fn add(&mut self, tool: &DetectedTool, counts: TokenCounts) {
             self.input_tokens = self.input_tokens.saturating_add(counts.input);
             self.output_tokens = self.output_tokens.saturating_add(counts.output);
@@ -2795,6 +2856,12 @@ mod ai_usage {
                 collection_method: "passive VS Code transcript/session reader",
                 sources: discover_copilot_sources(),
             },
+            DetectedTool {
+                id: "hermes",
+                display_name: "Hermes Agent",
+                collection_method: "read-only SQLite session summary reader",
+                sources: discover_hermes_sources(),
+            },
         ];
 
         candidates
@@ -2816,6 +2883,7 @@ mod ai_usage {
                 "codex" => scan_codex(tool),
                 "cursor" => scan_cursor(tool),
                 "copilot" => scan_copilot(tool),
+                "hermes" => scan_hermes(tool),
                 _ => TokenCounts::default(),
             };
             snapshot.add(tool, counts);
@@ -2936,6 +3004,56 @@ mod ai_usage {
             }
         }
         dedup_paths(sources)
+    }
+
+    fn discover_hermes_sources() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(root) = env_path("HERMES_HOME") {
+            roots.push(root.clone());
+            if let Some(profile_root) = hermes_profile_root(&root) {
+                roots.push(profile_root);
+            }
+        }
+        if let Some(root) = default_hermes_home() {
+            roots.push(root);
+        }
+
+        let mut sources = Vec::new();
+        for root in dedup_paths(roots) {
+            let db = root.join("state.db");
+            if db.exists() {
+                sources.push(db);
+            }
+
+            let profiles = root.join("profiles");
+            if let Ok(entries) = fs::read_dir(profiles) {
+                for entry in entries.flatten() {
+                    let db = entry.path().join("state.db");
+                    if db.exists() {
+                        sources.push(db);
+                    }
+                }
+            }
+        }
+        dedup_paths(sources)
+    }
+
+    fn default_hermes_home() -> Option<PathBuf> {
+        if cfg!(target_os = "windows") {
+            if let Some(local_appdata) = env_path("LOCALAPPDATA") {
+                return Some(local_appdata.join("hermes"));
+            }
+            return dirs::home_dir().map(|home| home.join("AppData").join("Local").join("hermes"));
+        }
+        dirs::home_dir().map(|home| home.join(".hermes"))
+    }
+
+    fn hermes_profile_root(path: &Path) -> Option<PathBuf> {
+        let profiles_dir = path.parent()?;
+        if profiles_dir.file_name().and_then(|s| s.to_str()) != Some("profiles") {
+            return None;
+        }
+        profiles_dir.parent().map(Path::to_path_buf)
     }
 
     fn vscode_workspace_storage_dirs(home: &Path) -> Vec<PathBuf> {
@@ -3080,6 +3198,54 @@ mod ai_usage {
             }
         }
         counts
+    }
+
+    fn scan_hermes(tool: &DetectedTool) -> TokenCounts {
+        let mut counts = TokenCounts::default();
+        for path in &tool.sources {
+            add(&mut counts, scan_hermes_db(path));
+        }
+        counts
+    }
+
+    fn scan_hermes_db(path: &Path) -> TokenCounts {
+        let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+            return TokenCounts::default();
+        };
+        let _ = conn.busy_timeout(Duration::from_millis(50));
+
+        let query = "SELECT \
+            COALESCE(SUM(input_tokens), 0), \
+            COALESCE(SUM(output_tokens), 0), \
+            COALESCE(SUM(cache_read_tokens), 0), \
+            COALESCE(SUM(cache_write_tokens), 0), \
+            COALESCE(SUM(reasoning_tokens), 0) \
+            FROM sessions";
+        let Ok((input, output, cache_read, cache_write, reasoning)) =
+            conn.query_row(query, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+        else {
+            return TokenCounts::default();
+        };
+
+        TokenCounts {
+            input: positive_token_count(input),
+            output: positive_token_count(output),
+            cached: positive_token_count(cache_read)
+                .saturating_add(positive_token_count(cache_write)),
+            reasoning: positive_token_count(reasoning),
+        }
+    }
+
+    fn positive_token_count(value: i64) -> u64 {
+        u64::try_from(value).unwrap_or(0)
     }
 
     fn scan_jsonl_token_fields(path: &Path) -> TokenCounts {
@@ -3277,5 +3443,129 @@ mod tests {
                 "ode".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn hermes_usage_scanner_reads_session_summary_db() {
+        let path = temp_state_db("scan/state.db");
+        write_hermes_usage_db(&path, &[(10, 4, 2, 3, 6), (5, 3, 1, 2, 0)]);
+
+        let tool = ai_usage::DetectedTool {
+            id: "hermes",
+            display_name: "Hermes Agent",
+            collection_method: "read-only SQLite session summary reader",
+            sources: vec![path],
+        };
+        let snapshot = ai_usage::scan_enabled(&[tool], &["hermes".to_string()]);
+
+        assert_eq!(snapshot.input_tokens, 15);
+        assert_eq!(snapshot.output_tokens, 7);
+        assert_eq!(snapshot.cached_tokens, 8);
+        assert_eq!(snapshot.reasoning_tokens, 6);
+        assert_eq!(snapshot.total_tokens(), 36);
+
+        let hermes = snapshot.tools.get("hermes").expect("hermes tool usage");
+        assert_eq!(hermes.input_tokens, 15);
+        assert_eq!(hermes.output_tokens, 7);
+        assert_eq!(hermes.cached_tokens, 8);
+        assert_eq!(hermes.reasoning_tokens, 6);
+        assert_eq!(hermes.sources, 1);
+    }
+
+    #[test]
+    fn consented_state_enables_new_detected_tools_with_current_baseline() {
+        let path = temp_state_db("migration/state.db");
+        write_hermes_usage_db(&path, &[(7, 3, 2, 1, 5)]);
+
+        let mut baseline = ai_usage::UsageSnapshot {
+            input_tokens: 10,
+            ..Default::default()
+        };
+        baseline.tools.insert(
+            "codex".to_string(),
+            ai_usage::ToolUsage {
+                input_tokens: 10,
+                sources: 2,
+                ..Default::default()
+            },
+        );
+        let mut state = PersistedState {
+            ai_usage_consent: true,
+            enabled_ai_tools: vec!["codex".to_string()],
+            ai_usage_baseline: Some(baseline),
+            ..Default::default()
+        };
+        let detected = vec![
+            ai_usage::DetectedTool {
+                id: "codex",
+                display_name: "Codex CLI",
+                collection_method: "passive rollout JSONL reader",
+                sources: vec![PathBuf::from("rollout.jsonl")],
+            },
+            ai_usage::DetectedTool {
+                id: "hermes",
+                display_name: "Hermes Agent",
+                collection_method: "read-only SQLite session summary reader",
+                sources: vec![path],
+            },
+        ];
+
+        assert!(enable_new_detected_ai_tools(&mut state, &detected));
+        assert_eq!(state.enabled_ai_tools, vec!["codex", "hermes"]);
+
+        let baseline = state.ai_usage_baseline.as_ref().expect("usage baseline");
+        assert_eq!(baseline.input_tokens, 17);
+        assert_eq!(baseline.output_tokens, 3);
+        assert_eq!(baseline.cached_tokens, 3);
+        assert_eq!(baseline.reasoning_tokens, 5);
+        assert_eq!(baseline.tools.get("codex").unwrap().input_tokens, 10);
+        let hermes = baseline.tools.get("hermes").expect("hermes baseline");
+        assert_eq!(hermes.input_tokens, 7);
+        assert_eq!(hermes.output_tokens, 3);
+        assert_eq!(hermes.cached_tokens, 3);
+        assert_eq!(hermes.reasoning_tokens, 5);
+        assert_eq!(hermes.sources, 1);
+
+        assert!(!enable_new_detected_ai_tools(&mut state, &detected));
+        assert_eq!(state.enabled_ai_tools, vec!["codex", "hermes"]);
+    }
+
+    fn temp_state_db(suffix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ascii-world-test-{}-{nanos}", std::process::id()));
+        let path = dir.join(suffix);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
+    fn write_hermes_usage_db(path: &Path, rows: &[(i64, i64, i64, i64, i64)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0
+            );",
+        )
+        .unwrap();
+        for row in rows {
+            conn.execute(
+                "INSERT INTO sessions (
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens
+                ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                [row.0, row.1, row.2, row.3, row.4],
+            )
+            .unwrap();
+        }
     }
 }
