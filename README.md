@@ -18,6 +18,64 @@ world
 
 Ascii World turns local coding-agent token activity into points, lobster yield, cosmetics, pixels, and a shared ASCII planet. Your local usage data stays local; the CLI reports gameplay totals to the multiplayer backend.
 
+## Build from source
+
+Install Rust with [rustup](https://rustup.rs/), then clone this repository and build the terminal client:
+
+```sh
+git clone https://github.com/ariana-dot-dev/ascii-world.git
+cd ascii-world
+cp cli/.env.production.example cli/.env.production
+cargo build --release --manifest-path cli/Cargo.toml
+./target/release/world
+```
+
+On Windows PowerShell:
+
+```powershell
+git clone https://github.com/ariana-dot-dev/ascii-world.git
+cd ascii-world
+Copy-Item cli/.env.production.example cli/.env.production
+cargo build --release --manifest-path cli/Cargo.toml
+.\target\release\world.exe
+```
+
+`cli/.env.production` should point at the public backend:
+
+```env
+GAME_BACKEND_URL=https://world.ascii.dev
+GAME_ENV=production
+```
+
+You can also run from source without a release build:
+
+```sh
+GAME_BACKEND_URL=https://world.ascii.dev cargo run --manifest-path cli/Cargo.toml
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:GAME_BACKEND_URL = "https://world.ascii.dev"
+cargo run --manifest-path cli/Cargo.toml
+```
+
+If you do not want to pipe an install script into your shell, download and inspect it first:
+
+```sh
+curl -fsSLO https://world.ascii.dev/install.sh
+less install.sh
+sh install.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://world.ascii.dev/install.ps1 -OutFile install.ps1
+notepad .\install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
 ## Development
 
 Run the CLI locally:
