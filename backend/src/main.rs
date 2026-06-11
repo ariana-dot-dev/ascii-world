@@ -14,7 +14,7 @@ use axum::{
         ws::{Message, WebSocket},
         Path as AxumPath, Query, State, WebSocketUpgrade,
     },
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -3582,16 +3582,18 @@ async fn download_cli_asset(AxumPath(asset): AxumPath<String>) -> Response {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/opt/ascii-game/releases/latest"));
     let path = asset_dir.join(&asset);
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return (StatusCode::NOT_FOUND, "asset not found").into_response();
-    };
+    if let Ok(bytes) = tokio::fs::read(path).await {
+        let content_type = if asset.ends_with(".exe") {
+            "application/vnd.microsoft.portable-executable"
+        } else {
+            "application/octet-stream"
+        };
+        return ([("content-type", content_type)], bytes).into_response();
+    }
 
-    let content_type = if asset.ends_with(".exe") {
-        "application/vnd.microsoft.portable-executable"
-    } else {
-        "application/octet-stream"
-    };
-    ([("content-type", content_type)], bytes).into_response()
+    let url =
+        format!("https://github.com/ariana-dot-dev/ascii-world/releases/latest/download/{asset}");
+    (StatusCode::FOUND, [(header::LOCATION, url)]).into_response()
 }
 
 struct AppError(anyhow::Error);
